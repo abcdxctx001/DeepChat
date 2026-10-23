@@ -1002,7 +1002,14 @@ class TreeManager:
             if nid in self.tree["nodes"]:
                 node = self.tree["nodes"][nid]
                 for k, v in kw.items():
-                    if k in ('assistantMessage','reasoning','title','model','usage','reasoningDuration','reasoningEffort','generating','images'):
+                    # 2026-10-23: 白名单补 stopReason / finishReason / thinkingEnabled。
+                    # 记录本轮结束原因（user_stop / empty_reply / stream_end / error
+                    # / content_filter）。原来这些键会被静默丢弃，
+                    # 前端因此拿不到「为什么没有回答」的依据。
+                    if k in ('assistantMessage','reasoning','title','model',
+                             'usage','reasoningDuration','reasoningEffort',
+                             'generating','images','stopReason','finishReason',
+                             'thinkingEnabled'):
                         node[k] = v
                 # ★ 用量计价以调用时间为准：写入 usage 时同时记录调用时间戳（峰谷定价）
                 if kw.get('usage') is not None:
@@ -7949,6 +7956,11 @@ def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input):
     reasoning_start = time.time()
     usage_info = None
     _user_stopped = False      # ★ 2026-10-05：用户点了「停止生成」
+    # ★ 2026-10-23：记录本轮**为什么结束**，让"说到一半没了/没有回答"可解释。
+    #   user_stop = 用户点了停止；empty_reply = 流正常结束但没产出回答；
+    #   stream_end = 正常结束；error = 抛异常。
+    _finish_reason = None
+    _stop_reason = None
     try:
         stream = get_client().chat.completions.create(
             model=model, messages=msgs, stream=True,
@@ -7965,6 +7977,7 @@ def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input):
                 if nid in cancelled_nodes:
                     cancelled_nodes.discard(nid)
                     _user_stopped = True
+                    _stop_reason = 'user_stop'
                     logging.info(f"[CHAT] 节点 {nid} 生成已按用户要求中断")
                     try:
                         stream.close()
@@ -7978,6 +7991,12 @@ def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input):
                               "ts": time.time()}   # ★ 用量计价以调用时间为准（峰谷定价）
                 update_node_in_tree(nid, usage=usage_info)
                 continue
+            try:
+                _fr = getattr(chunk.choices[0], 'finish_reason', None)
+                if _fr:
+                    _finish_reason = _fr
+            except Exception:
+                pass
             reasoning = getattr(chunk.choices[0].delta, 'reasoning_content', None)
             if reasoning:
                 full_reasoning += reasoning
@@ -7999,10 +8018,23 @@ def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input):
         update_node_in_tree(nid, title=title)
     except Exception as e:
         logging.error(f"节点 {nid} 生成失败: {e}")
+        _stop_reason = 'error'
         update_node_in_tree(nid, assistantMessage=f"[生成失败: {str(e)}]")
     finally:
-        update_node_in_tree(nid, generating=False)
+        # ★ 2026-10-23：把"为什么没有回答"写进节点，并在服务端留一行可查的日志。
+        #   现象：用户只看到思考断了半句、下面全空，无法判断是被停止还是出了故障。
+        if _stop_reason is None:
+            _stop_reason = 'empty_reply' if not full_content else 'stream_end'
+        try:
+            update_node_in_tree(nid, generating=False,
+                                stopReason=_stop_reason,
+                                finishReason=(_finish_reason or ''))
+        except Exception:
+            update_node_in_tree(nid, generating=False)
         if usage_info: update_node_in_tree(nid, usage=usage_info)
+        logging.info(f"[CHAT] {nid} 结束 reason={_stop_reason} "
+                     f"finish={_finish_reason or '-'} "
+                     f"reasoning={len(full_reasoning)}字 answer={len(full_content)}字")
 
 def _operation_stream_response(sid, messages, model, r_eff, think, session_extra=None,
                                start_parent=True):
