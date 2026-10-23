@@ -1,0 +1,15 @@
+edit 0000000000560A74 gettextlen=23
+edit 0000000000560A74 gettext=23 dt=21 first=
+child hwnd=0000000000560A74 cls=Edit off=(8,51) sm=1 n=928529
+child hwnd=000000000033085A cls=msctls_statusbar32 off=(8,729) sm=1 n=0
+top hwnd=00000000000F0B26 size=1440x759 sm=1 n=930126
+edit 0000000000560A74 gettextlen=23
+edit 0000000000560A74 gettext=23 dt=21 first=
+child hwnd=0000000000560A74 cls=Edit off=(8,51) sm=1 n=928529
+child hwnd=000000000033085A cls=msctls_statusbar32 off=(8,729) sm=1 n=0
+top hwnd=00000000000F0B26 size=1440x759 sm=1 n=930126
+edit 0000000000560A74 gettextlen=23
+edit 0000000000560A74 gettext=23 dt=21 first=
+child hwnd=0000000000560A74 cls=Edit off=(8,51) sm=1 n=928529
+child hwnd=000000000033085A cls=msctls_statusbar32 off=(8,729) sm=1 n=0
+top hwnd=00000000000F0B26 size=1440x759 sm=1 n=930126

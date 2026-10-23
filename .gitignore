@@ -1,0 +1,92 @@
+# ============================================================
+#  构建产物与运行时目录（不入库）
+# ============================================================
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包产物：可自行用 tool/pack_all.bat 生成，不入库
+*.exe
+*.zip
+
+# 日志
+*.log
+
+# ★ 密钥：绝不入库（server/workspace/settings.json 含 api_key）
+server/api-key.env
+server/workspace/settings.json
+server/workspace/settings.json.*bak
+server/workspace/uploads/
+server/workspace/memories/
+server/workspace/chat_tree.json
+server/workspace/*.zip
+
+# ============================================================
+#  client/workspace
+#  ★ 注意不要整目录排除！曾经的规则是 `client/workspace/`，结果把
+#    **源码运行必需的组件**（GUI/ 里的 virtual_ui.py、PIL、capture_dll、
+#    ocr.ps1，以及 fetch_page.js）也挡在仓库外 —— 别人 clone 下来跑不起来
+#    （屏幕功能与网页抓取全废）。现在只精确排除运行时数据。
+# ============================================================
+client/workspace/node/
+client/workspace/node_modules/
+client/workspace/python/
+client/workspace/mingw64/
+client/workspace/memories/
+client/workspace/screenshots/
+client/workspace/capture/
+client/workspace/tool_outputs/
+client/workspace/tool_test/
+client/workspace/tool_test_demo/
+client/workspace/test_sandbox/
+client/workspace/tests/
+client/workspace/agent_demo/
+client/workspace/agent_test/
+client/workspace/workspace/
+client/workspace/GUI/__pycache__/
+client/workspace/GUI/PIL/__pycache__/
+client/workspace/GUI/*_log.txt
+client/workspace/*.png
+# agent 运行时产生的临时脚本/测试输出（用户真实跑过留下的），不属于交付物
+client/workspace/*.py
+client/workspace/*.txt
+client/workspace/*.bat
+client/workspace/*_report*.md
+client/workspace/自我介绍*.md
+!client/workspace/fetch_page.js
+
+# ============================================================
+#  控制面板的运行时产物（logs 是运行/测试时生成的）
+# ============================================================
+launcher/logs/
+**/logs/panel_ready
+launcher/__pycache__/
+tool/launcher/logs/
+**/logs/panel_ready
+tool/launcher/*.pid
+tool/launcher/_svg_*.png
+tool/launcher/__pycache__/
+
+# ============================================================
+#  开发脚手架（不属于交付物）
+# ============================================================
+.backups/
+.test/
+tool/data/
+tool/SNIBypassGUI-v4.6/
+SNIBypassGUI-v4.6/
+tool/_test_agent.py
+tool/_test_server.py
+tool/_integrate_to_czz.py
+tool/backup_*.ps1
+HEAD
+
+# ============================================================
+#  日志与调试落盘（运行时生成，不入库）
+#  ★ thinking_dump 是"思考落盘"调试数据，每次会话都会新增 jsonl，别入库
+# ============================================================
+server/logs/
+
+# 模板备份（改 index.html 时生成）
+server/templates/*.bak
+

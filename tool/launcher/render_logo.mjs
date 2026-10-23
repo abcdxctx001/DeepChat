@@ -1,0 +1,27 @@
+﻿import { readFileSync, writeFileSync } from 'fs';
+const CDP='http://127.0.0.1:9222';
+const j=async(p,i)=>(await fetch(CDP+p,i)).json();
+const list=await j('/json/list'); let t=list.find(x=>x.type==='page');
+const ws=new WebSocket(t.webSocketDebuggerUrl);
+await new Promise((r,x)=>{ws.onopen=r;ws.onerror=x;});
+let id=0;const pend=new Map();
+ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id&&pend.has(m.id)){const{res,rej}=pend.get(m.id);pend.delete(m.id);m.error?rej(new Error(JSON.stringify(m.error))):res(m.result);}};
+const send=(me,pa={})=>new Promise((res,rej)=>{const i=++id;pend.set(i,{res,rej});ws.send(JSON.stringify({id:i,method:me,params:pa}));setTimeout(()=>{if(pend.has(i)){pend.delete(i);rej(new Error('t '+me));}},120000);});
+const ev=async(x,a=false)=>{const r=await send('Runtime.evaluate',{expression:x,awaitPromise:a,returnByValue:true});if(r.exceptionDetails)throw new Error(JSON.stringify(r.exceptionDetails.exception));return r.result.value;};
+const svg=readFileSync('D:/downloads/DeepChat/server/static/logo.svg','utf8');
+await send('Page.enable');await send('Runtime.enable');
+await send('Page.navigate',{url:'about:blank'});
+await new Promise(r=>setTimeout(r,1200));
+const b64=await ev(`(async()=>{
+  const S=1024;
+  const cv=document.createElement('canvas');cv.width=S;cv.height=S;
+  const ctx=cv.getContext('2d');
+  const img=new Image();
+  const url=URL.createObjectURL(new Blob([${JSON.stringify(svg)}],{type:'image/svg+xml'}));
+  await new Promise((res,rej)=>{img.onload=res;img.onerror=rej;img.src=url;});
+  ctx.drawImage(img,0,0,S,S);
+  return cv.toDataURL('image/png').split(',')[1];
+})()`,true);
+writeFileSync('D:/downloads/DeepChat/tool/launcher/_svg_1024.png', Buffer.from(b64,'base64'));
+console.log('  ✅ 1024px 渲染完成');
+process.exit(0);
