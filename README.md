@@ -277,9 +277,23 @@ tool\pack_all.bat
 
 ---
 
+## AI 使用说明
+
+本仓库代码绝大部分由 AI 编程助手生成。作者的工作主要是需求定义、架构方向、方案取舍与
+验收，并对最终交付形态负责。
+
+作者不对 AI 生成部分的独创性作主张。`LICENSE` 中的 MIT 条款完整适用（授予使用、修改、
+再分发等权利，并附免责声明），但作者无法保证对全部内容享有著作权。若你要在强依赖著作权
+的场景下使用本仓库，请自行评估。
+
+---
+
 ## 许可
 
 [MIT](LICENSE)
+
+本仓库包含若干第三方开源组件（Pillow、highlight.js、marked、KaTeX），它们各自的版权
+声明与许可原文见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 > **关于 control.py 为什么有多份**：控制面板是产品自带功能，`app.py` / `agent.py` 通过
 > `import control` 加载它。分发时用户可能**只拿到 client 目录**（「下载本地代理」给的就是
