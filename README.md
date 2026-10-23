@@ -26,6 +26,63 @@
 
 ---
 
+## 平台支持
+
+**当前只适配 Windows。** 这是实现层面的限制，不是架构限制：
+
+| 组件 | 能否跑在 Linux / macOS | 原因 |
+|---|---|---|
+| `server/app.py`（Web UI + 编排） | **可以** | 纯 Python + Flask，只有 2 处 Windows 特化（文件原子替换分支、控制台标题），依赖全是跨平台的 |
+| `server/control.py`（控制面板） | 大体可以 | tkinter / pystray 跨平台；`taskkill`、`CREATE_NO_WINDOW` 都有平台分支 |
+| `client/agent.py`（本机代理） | **不行** | 重度依赖 Windows：`taskkill /T` 杀进程树、多行命令写临时 `.bat`、`#run_pwsh`、`CREATE_NO_WINDOW`；捆绑的 `mingw64/g++.exe`、`node.exe` 也是 Windows 二进制 |
+| `client/workspace/GUI/virtual_ui.py`（屏幕操作） | **不行** | 纯 Win32：`ctypes.wintypes`、`user32`（166 处）、`gdi32`（37 处）、`BitBlt` / `PrintWindow` / `SendInput`，OCR 走系统自带 `winsdk` |
+| 启动 / 打包脚本 | **不行** | `run.bat`、`pack_all.bat`、`make_*_zip.ps1`（.NET） |
+
+**实用结论：**
+
+- 想在自己机器上完整使用（能执行命令、操作屏幕）→ **必须 Windows**，因为 agent 必须与浏览器同机。
+- 只是想让别人用网页聊天 → **server 可以单独部署到 Linux 服务器**，agent 留在 Windows 本机。
+  这正是架构把三者拆开的目的：server 可远程，agent 必须与浏览器同机。
+
+> 移植 Linux 的主要工作在「执行层」而不是架构：`agent.py` 的进程管理/脚本执行换成 POSIX 版本，
+> `virtual_ui.py` 需要按 X11/Wayland 重写（截图、键鼠注入、OCR）。
+
+---
+
+## 为什么还要造这个 Harness
+
+市面上已有 DSH、Codex、Claude Code 等更齐全的工具。做这个项目的取舍是：
+
+### 1. 省 Token
+
+- **缓存命中率高**：同一会话连续多轮时，输入大部分命中缓存（实测常在 90% 以上，长会话可达 98%+），
+  而缓存价通常是未命中的 1/50（DeepSeek 官方定价 `0.02` vs `1.0` 元/百万 tokens）。
+- **主动控制上下文膨胀**：`compress_context` 手动压缩 + 用量达到 50%（可调）自动警告，
+  压缩后只保留阶段摘要，丢弃历史。
+- 作者实测：同样的轻量任务，费用约为直接使用官方 DSH 的一半。
+
+### 2. 「重启即还原」机房环境的完美适配
+
+- **无状态设计**：没有任何数据库，所有数据都是 JSON 文件
+  （`chat_tree.json` 对话树、`plans.json` 任务计划、`workspace/memories/` 记忆库、`settings.json` 配置）。
+- 重启后 `list` + `load` 即可把上下文接回来；机房/容器重启不丢工作。
+- **轻量**：全仓约 3.2 万行（不含打包进 client.zip 的 node / python / mingw64 运行时），
+  装了 Python 就能跑；用 `.exe` 则连依赖都不用装。
+
+### 3. 团队共享的 Web 工作台
+
+- 一人部署，全员打开浏览器就能用（server 可放在内网机器上）。
+- 文件与命令都在同一个共享工作区：上传的文件、执行的操作、产生的中间产物，
+  所有人看到的是同一份，信息透明。
+
+### 4. 独特的文件交互体验
+
+- 上传 PDF / Office / 代码文件，自动解析内容供模型阅读，并在侧边栏查看器中显示。
+- 模型回答里写 `[文件: 完整路径]` 会渲染成**可点击的文件卡片**，点一下直接在本机打开。
+- **实时 token 价格计算**：按模型分别计费，区分空闲/高峰两个价位，显示缓存命中率、费用与上下文占用。
+
+---
+
 ## 功能
 
 ### 两种模式
@@ -179,7 +236,7 @@ DeepChat/
 │       ├── memories/       本地记忆库
 │       └── tool_outputs/   超长工具输出的落盘目录（运行时生成）
 └── tool/
-    ├── sync_uploads.py     同步三个交付目录 + 交付校验
+    ├── sync_uploads.py     打包产物的分发与校验（开发用）
     ├── pack_all.bat        全量打包（生成 app.exe / agent.exe / client.zip）
     ├── pack/               打包脚本（make_client_zip / make_server_zip / replace_exe）
     ├── launcher/           control.py 的同源副本 + 图标生成 + 控制面板测试
@@ -206,24 +263,6 @@ tool\pack_all.bat
 
 打包需要 PyInstaller；脚本会自动准备精简虚拟环境（`.backups\venv_pack`），
 **切勿用 Anaconda 全家桶直接打包** —— 会把 MKL/ICU 等数百 MB 无关 DLL 打进去（exe 从 ~25MB 涨到 ~370MB）。
-
-### 三个交付目录
-
-```bat
-python tool\sync_uploads.py            :: 三个目录一起同步
-python tool\sync_uploads.py --dry-run  :: 只看变更
-python tool\sync_uploads.py --check    :: 只做交付校验（含 control.py 一致性）
-```
-
-| 目录 | 含 exe | 运行时数据 | settings |
-|---|---|---|---|
-| `D:\uploads\DeepChat` | ❌ | ❌ | 不含（源码版，推 GitHub） |
-| `D:\uploads\DeepChat-出厂设置版` | ✅ | ❌ | DeepSeek `flash` + `pro`，key 为空 |
-| `D:\uploads\DeepChat-可运行版` | ✅ | ✅ 对话树 + 记忆库 | 真实配置（自用） |
-
-脚本对 `client/workspace` 与 `server/workspace` 采用**白名单（默认拒绝）**，只放行
-`GUI/`、`fetch_page.js`、`client.zip`、`settings.json` 与（可运行版的）记忆库/对话树，
-避免把测试产物、日志、缓存打进分发包。
 
 ---
 
