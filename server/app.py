@@ -3247,6 +3247,11 @@ def _maybe_warn_context(sid, internal, holder, emit_fn, usage):
 #   这里只作为缺省值；实际取 settings["web_tool_price_per_1k"]。
 DEEPSEEK_TOOLS_PRICE_PER_1K = 5.0     # 默认：元 / 1000 次成功请求
 
+# ★ 2026-10-23：服务器版本号 —— **最新版本以此为准**。
+#   注入页面后由前端与本地代理自报的版本比对，低则提示升级。
+#   未标记版本的老代理按 '2.0' 处理。
+APP_VERSION = '2.1'
+
 
 def web_tool_price_per_1k():
     """读取联网工具单价（元 / 1000 次成功请求）。非法值回退默认 5.0。"""
@@ -8401,6 +8406,12 @@ def downloads_info():
         "agent_exe": _info("agent.exe", AGENT_EXE_PATH, "/download/agent.exe"),
     })
 
+@app.route('/api/version')
+def api_version():
+    """当前服务器版本（最新版由服务器决定）。"""
+    return jsonify({"success": True, "app": "DeepChat Server", "version": APP_VERSION})
+
+
 @app.route('/')
 def index():
     # ★ 客户端代理地址可经环境变量 AGENT_URL 覆盖（默认 5001；测试实例可用 5003 等端口）
@@ -8410,7 +8421,10 @@ def index():
     #   于是"明明改了却没生效"，用户与我都反复被误导（实测过好几轮：
     #   界面上跑的是旧 JS，服务端与磁盘代码却都是新的）。
     #   页面本身只有几百 KB 且必须随版本走，禁掉缓存最省心。
-    resp = make_response(render_template('index.html', agent_url=agent_url))
+    # ★ 2026-10-23：把**服务器版本**注入页面。前端用它和本地代理自报的版本比对，
+    #   低于服务器版本时提示升级（最新版由服务器决定）。
+    resp = make_response(render_template('index.html', agent_url=agent_url,
+                                         app_version=APP_VERSION))
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     resp.headers['Pragma'] = 'no-cache'
     resp.headers['Expires'] = '0'

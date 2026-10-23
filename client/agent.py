@@ -73,6 +73,11 @@ os.makedirs(WORK_DIR, exist_ok=True)
 # 超长工具输出落盘目录（客户端机器本地，模型工作目录下，模型可自行读取继续分析）
 TOOL_OUTPUT_DIR = os.path.join(WORK_DIR, 'tool_outputs')
 
+# ★ 本地代理版本号。与 server/app.py 的 APP_VERSION 对应：
+#   前端拿两者比对，代理版本低于服务器版本时提示升级。
+#   未标记版本的老代理（/health 不含 version）统一按 '2.0' 处理。
+AGENT_VERSION = '2.1'
+
 # ---- 屏幕操作组件（虚拟桌面 + OCR + 模拟键鼠）位于 workspace/GUI 目录 ----
 # virtual_ui.py / ocr.ps1 / capture_dll / README_SCREEN_UI.md 统一放在 GUI 文件夹
 # 打包为 exe 时：优先使用 exe 旁的 workspace/GUI（完整包部署，DLL 路径推导一致），
@@ -1485,7 +1490,12 @@ def open_folder():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok"})
+    """健康检查。★ 2026-10-23：同时上报**本地代理版本**，供前端做升级提示。
+
+    老版本（V2.0 及更早）的 /health 只返回 {"status": "ok"}，没有 version 字段 ——
+    前端据此把缺失的版本一律当作 '2.0'。
+    """
+    return jsonify({"status": "ok", "app": "DeepChat Agent", "version": AGENT_VERSION})
 
 # ================= 虚拟桌面 + OCR + 模拟输入（REST） =================
 @app.route('/vdesk', methods=['POST'])

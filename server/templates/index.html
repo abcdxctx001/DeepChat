@@ -66,6 +66,12 @@
         .agent-status{display:none;padding:0.5rem;border-radius:8px;font-size:0.8rem;text-align:center}
         .agent-status.connected{background:#dcfce7;color:#166534}
         .agent-status.disconnected{background:#fee2e2;color:#991b1b}
+/* ★ 2026-10-23：本地代理版本落后提示。字号比「已连接」那条略小（0.74rem），
+   避免长句撑成大字块；单独一档配色，和连接状态区分开。 */
+.agent-version-warn{display:none;padding:0.45rem 0.55rem;border-radius:8px;
+  font-size:0.74rem;line-height:1.45;text-align:center;
+  background:#fef9c3;color:#854d0e;border:1px solid #fde68a}
+.agent-version-warn b{color:#713f12}
         .agent-refresh-btn{background:none;border:none;font-size:1rem;cursor:pointer;margin-left:0.5rem;color:inherit;vertical-align:middle}
         .clear-op-btn{background:#ef4444;color:white;border:none;border-radius:8px;padding:0.5rem 1rem;cursor:pointer;font-size:0.85rem;display:none}
         .clear-op-btn:hover{background:#dc2626}
@@ -485,6 +491,8 @@ body.dark .msg-img-lost{background:#1e293b;border-color:#475569;color:#94a3b8}
         body.dark .mode-indicator{background:var(--panel-3);color:var(--tx-sub)}
         body.dark .agent-status.connected{background:var(--ok-bg);color:var(--ok-fg)}
         body.dark .agent-status.disconnected{background:var(--danger-bg);color:var(--danger-fg)}
+body.dark .agent-version-warn{background:#3f3410;color:#fde68a;border-color:#78350f}
+body.dark .agent-version-warn b{color:#fef08a}
         body.dark .toggle-switch{background:var(--panel-2);border-color:var(--border-2)}
         body.dark .toggle-switch span{color:var(--tx-strong)}
         body.dark .setting-item label{color:var(--tx-sub)}
@@ -650,6 +658,8 @@ body.dark .msg-img-lost{background:#1e293b;border-color:#475569;color:#94a3b8}
         <span id="agentStatusIcon">🟡</span> <span id="agentStatusText">正在检测...</span>
         <button class="agent-refresh-btn" id="agentRefreshBtn" title="手动刷新">🔄</button>
     </div>
+    <!-- ★ 2026-10-23：本地代理版本落后提示（版本号由服务器决定；老代理无版本 → 按 2.0） -->
+    <div class="agent-version-warn" id="agentVersionWarn"></div>
     <div class="settings-container" id="settingsContainer">
         <div class="setting-item"><label>🔧 模式</label><select id="modeSelect"><option value="chat" selected>💬 树状对话</option><option value="operation">🖥️ 操作模式</option></select></div>
         <div class="setting-item"><label>🤖 模型</label><select id="modelSelect"></select></div>
@@ -1036,6 +1046,8 @@ body.dark .msg-img-lost{background:#1e293b;border-color:#475569;color:#94a3b8}
 <script>
 const BASE_URL=window.location.origin;
 const AGENT_URL={{ agent_url|tojson }};
+// ★ 2026-10-23：服务器版本（最新版由服务器决定），用于和本地代理版本比对
+const SERVER_VERSION = {{ app_version|tojson }};
 const LAST_NODE_KEY='deepseek_last_node',COLLAPSE_KEY='deepseek_collapse',FILE_NAMES_KEY='fileNames',SETTINGS_KEY='deepseek_settings',POLL_INTERVAL=3000,TICK_INTERVAL=50,CHARS_PER_TICK=5,SYNC_INTERVAL=20000;
 // ===== 操作模式设置（设置弹窗）：工具开关 / 超时 / 自动保存 / 刷新间隔 / 截断 / 记忆列表上限 =====
 const OP_SETTINGS_KEY='deepseek_op_settings';
@@ -3709,17 +3721,51 @@ function goToStep2(){document.getElementById('wizardStep1').style.display='none'
 function populateStep2(){const c=document.getElementById('wizardStep2Content');if(!c)return;let h='';const hasPy=selectedComponents.has('agent_py');const hasExe=selectedComponents.has('agent_exe');if(hasPy&&hasExe){h+='<div class="download-option" style="margin-bottom:0.5rem;"><div class="download-option-title">🐍 方式一：run.bat 启动</div><div style="margin:0.2rem 0 0 0.3rem;font-size:0.83rem;">解压后双击 <code>run.bat</code>，自动安装依赖并启动（需已安装 Python 3）</div></div>';h+='<div class="download-option" style="margin-bottom:0.5rem;"><div class="download-option-title">⚡ 方式二：agent.exe 启动</div><div style="margin:0.2rem 0 0 0.3rem;font-size:0.83rem;">双击 <code>agent.exe</code>，免安装直接启动</div></div>'}else if(hasPy){h+='<div class="download-option" style="margin-bottom:0.5rem;"><div class="download-option-title">🐍 run.bat 启动</div><div style="margin:0.2rem 0 0 0.3rem;font-size:0.83rem;">解压后双击 <code>run.bat</code>，自动安装依赖并启动（需已安装 Python 3）</div></div>'}else if(hasExe){h+='<div class="download-option" style="margin-bottom:0.5rem;"><div class="download-option-title">⚡ agent.exe 启动</div><div style="margin:0.2rem 0 0 0.3rem;font-size:0.83rem;">双击 <code>agent.exe</code>，免安装直接启动</div></div>'}else{h+='<p style="color:var(--tx-muted2);">请返回上一步至少勾选一个代理组件（agent.py 或 agent.exe）。</p>'}c.innerHTML=h}
 document.getElementById('btnCheckAgain').addEventListener('click',async()=>{await checkAgent();if(!agentAvailable)alert('代理仍未连接。')});
 document.getElementById('agentRefreshBtn').addEventListener('click',checkAgent);
+// 版本比较：a < b 返回 true。仅处理 "2.1" 这类数字段，缺失/非法按 0 处理。
+function _verLt(a, b){
+    const pa = String(a || '0').split('.').map(x => parseInt(x, 10) || 0);
+    const pb = String(b || '0').split('.').map(x => parseInt(x, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const x = pa[i] || 0, y = pb[i] || 0;
+        if (x !== y) return x < y;
+    }
+    return false;
+}
+// 最近一次从 /health 拿到的代理版本（切模式时要重新判定）
+let _lastAgentVersion = null;
+// 显示/隐藏「本地代理版本落后」提示
+function updateAgentVersionWarn(agentVer){
+    const el = document.getElementById('agentVersionWarn');
+    // 老代理 /health 不含 version → 一律视为 2.0
+    const ag = agentVer || '2.0';
+    _lastAgentVersion = ag;          // 记住，供模式切换时复用
+    if (!el) return;
+    // ★ 2026-10-23：**只在操作模式提示**。
+    //   对话模式不执行本地命令，本地代理版本与它无关，
+    //   在对话框里冒出"升级本地代理"只会让人困惑（用户截图反馈）。
+    if (currentMode !== 'operation') { el.style.display = 'none'; el.innerHTML = ''; return; }
+    const srv = (typeof SERVER_VERSION === 'string' && SERVER_VERSION) ? SERVER_VERSION : '';
+    if (!srv || !_verLt(ag, srv)) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    el.innerHTML = 'ℹ️ 您正在使用的本地代理版本 <b>V' + ag + '</b> 落后于最新版 <b>V' + srv +
+                   '</b>，请升级以体验最新功能';
+    el.style.display = 'block';
+}
+
 async function checkAgent(){
     // ★ 容错：主线程繁忙时 fetch 回调可能延迟，放宽超时且连续失败 2 次才判为断开，
     //   避免前端卡顿期间误弹“启动客户端代理”激活向导。
     try{
         const res=await fetch(`${AGENT_URL}/health`,{method:'GET',signal:AbortSignal.timeout(8000)});
-        if(res.ok&&(await res.json()).status==='ok'){
+        const _hj = res.ok ? await res.json() : null;
+        if(_hj && _hj.status==='ok'){
+            // ★ 版本比对：老代理没有 version 字段 → 按 2.0
+            try{ updateAgentVersionWarn(_hj.version); }catch(e){}
             agentFailCount=0;
             if(!agentAvailable){agentAvailable=true;document.getElementById('agentStatus').className='agent-status connected';document.getElementById('agentStatusIcon').textContent='🟢';document.getElementById('agentStatusText').textContent='本地代理已连接';if(currentMode==='operation'){hideActivationWizard();inputArea.style.display='flex';document.getElementById('agentPanel').style.display='flex';if(!operationChatInitialized){operationChatInitialized=true;messagesArea.innerHTML='<div class="message assistant-msg"><div class="bubble">🖥️ 操作模式已激活，本地代理已连接。</div></div>';resetChildAgentState();linearMessages=[{role:"system",content:"You are a helpful assistant."}]}}}
             return;
         }
     }catch(e){}
+    try{ const _v=document.getElementById('agentVersionWarn'); if(_v){_v.style.display='none';} }catch(e){}
     agentFailCount=(agentFailCount||0)+1;
     if(agentFailCount>=2&&agentAvailable){agentAvailable=false;document.getElementById('agentStatus').className='agent-status disconnected';document.getElementById('agentStatusIcon').textContent='🔴';document.getElementById('agentStatusText').textContent='本地代理未连接';if(currentMode==='operation'){inputArea.style.display='none';showActivationWizard()}}
 }
@@ -7626,7 +7672,7 @@ async function importOperationFile(file) {
 }
 
 // 模式切换
-modeSelect.addEventListener('change',()=>{currentMode=modeSelect.value;document.querySelectorAll('.agent-panel.fullscreen').forEach(p=>{p.classList.remove('fullscreen');const c=p.querySelector('.panel-fs-close');if(c)c.remove();});if(currentMode==='chat'){if(smOpen)smClosePanel();smOpenBtn.style.display='none';clearOpBtn.style.display='none';updateStopBtnLabel();document.getElementById('agentStatus').style.display='none';document.getElementById('agentPanel').style.display='none';document.getElementById('processPanel').style.display='none';document.getElementById('planPanel').style.display='none';currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();clearAskQuestions();treeContainer.style.display='block';searchTrigger.style.display='';chatSettingsTrigger.style.display='';opSettingsTrigger.style.display='none';sessionInfoTrigger.style.display='none';searchArea.style.display='none';settingsContainer.style.display='flex';searchActive=false;treeHeader.style.display='flex';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出';importBtn.textContent='⬆️ 导入';inputArea.style.display='flex';messagesArea.innerHTML='';hideActivationWizard();closeSessionInfo();loadTree()}else{smOpenBtn.style.display='flex';clearOpBtn.style.display='inline-block';updateStopBtnLabel();document.getElementById('agentStatus').style.display='block';document.getElementById('agentPanel').style.display='flex';document.getElementById('processPanel').style.display='flex';document.getElementById('planPanel').style.display='flex';renderAskPanel();currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();treeContainer.style.display='none';searchTrigger.style.display='none';chatSettingsTrigger.style.display='none';opSettingsTrigger.style.display='';sessionInfoTrigger.style.display='';searchArea.style.display='none';settingsContainer.style.display='flex';treeHeader.style.display='none';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出操作';importBtn.textContent='⬆️ 导入操作';operationTranscript=[];operationMeta={model:'',reasoning_effort:'',thinking_enabled:true,session_id:null};if(agentAvailable){inputArea.style.display='flex';operationChatInitialized=true;messagesArea.innerHTML='<div class="message assistant-msg"><div class="bubble">🖥️ 操作模式已激活</div></div>';linearMessages=[{role:"system",content:"You are a helpful assistant."}]}else{inputArea.style.display='none';showActivationWizard()}}updateModeIndicator()});
+modeSelect.addEventListener('change',()=>{currentMode=modeSelect.value;document.querySelectorAll('.agent-panel.fullscreen').forEach(p=>{p.classList.remove('fullscreen');const c=p.querySelector('.panel-fs-close');if(c)c.remove();});if(currentMode==='chat'){if(smOpen)smClosePanel();smOpenBtn.style.display='none';clearOpBtn.style.display='none';updateStopBtnLabel();document.getElementById('agentStatus').style.display='none';try{updateAgentVersionWarn(_lastAgentVersion);}catch(e){}document.getElementById('agentPanel').style.display='none';document.getElementById('processPanel').style.display='none';document.getElementById('planPanel').style.display='none';currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();clearAskQuestions();treeContainer.style.display='block';searchTrigger.style.display='';chatSettingsTrigger.style.display='';opSettingsTrigger.style.display='none';sessionInfoTrigger.style.display='none';searchArea.style.display='none';settingsContainer.style.display='flex';searchActive=false;treeHeader.style.display='flex';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出';importBtn.textContent='⬆️ 导入';inputArea.style.display='flex';messagesArea.innerHTML='';hideActivationWizard();closeSessionInfo();loadTree()}else{smOpenBtn.style.display='flex';clearOpBtn.style.display='inline-block';updateStopBtnLabel();document.getElementById('agentStatus').style.display='block';try{updateAgentVersionWarn(_lastAgentVersion);}catch(e){}document.getElementById('agentPanel').style.display='flex';document.getElementById('processPanel').style.display='flex';document.getElementById('planPanel').style.display='flex';renderAskPanel();currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();treeContainer.style.display='none';searchTrigger.style.display='none';chatSettingsTrigger.style.display='none';opSettingsTrigger.style.display='';sessionInfoTrigger.style.display='';searchArea.style.display='none';settingsContainer.style.display='flex';treeHeader.style.display='none';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出操作';importBtn.textContent='⬆️ 导入操作';operationTranscript=[];operationMeta={model:'',reasoning_effort:'',thinking_enabled:true,session_id:null};if(agentAvailable){inputArea.style.display='flex';operationChatInitialized=true;messagesArea.innerHTML='<div class="message assistant-msg"><div class="bubble">🖥️ 操作模式已激活</div></div>';linearMessages=[{role:"system",content:"You are a helpful assistant."}]}else{inputArea.style.display='none';showActivationWizard()}}updateModeIndicator()});
 // ==================== 会话属性面板（操作模式 💬 按钮） ====================
 // 展示：标题（可改，同时作为导出文件名） / 时间（忙碌·LLM·工具·等提问·首token·输出速度）
 //       用量（★ 按模型分开计费：Flash 与 Pro 各用各自单价） / 上下文占用组成部分
