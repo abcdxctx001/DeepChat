@@ -90,3 +90,16 @@ server/logs/
 # 模板备份（改 index.html 时生成）
 server/templates/*.bak
 
+
+# ★ 2026-11-01：备份/临时副本一律不入库
+#   起因：tool/pack_all.bat.bak_before_sync 曾被 git add -A 带进来过
+#   （备份内容本身无敏感信息，但属于噪音；历史里那个提交保留，不改写）
+*.bak
+*.bak_*
+*.before_*
+*.orig
+*.regressed
+*.old
+*.tmp
+*.swp
+*~

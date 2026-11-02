@@ -1613,7 +1613,7 @@ function ensureChildSection(agentId) {
     body.className = 'agent-section-body';
     section.appendChild(head);
     section.appendChild(body);
-    messagesArea.appendChild(section);
+    _opArea().appendChild(section);
     const s = {
         section, head, body,
         container: null,                 // 当前轮次活动容器 {container,bubble,reasoningContent}
@@ -2491,7 +2491,11 @@ function iconizeTitle(html){
     });
 }
 
-function renderMarkdown(text){if(!text)return'';if(typeof marked==='undefined')return fallbackMarkdown(text);const codeFragments=[];let codeIdx=0;const safeText=text.replace(/(```[\s\S]*?```|`[^`\n]+`)/g,m=>{codeFragments.push(m);return`\x00CODE${codeIdx++}\x00`});const latexBlocks=[];function protectFormulas(seg){seg=seg.replace(/\\\[([\s\S]*?)\\\]/g,(_,f)=>{latexBlocks.push({type:'block',formula:f.trim()});return`\nLATEXBLOCK${latexBlocks.length-1}END\n`});seg=seg.replace(/(?:^|\n)\s*\$\$\s*([\s\S]*?)\s*\$\$\s*(?=\n|$)/g,(_,f)=>{latexBlocks.push({type:'block',formula:f.trim()});return`\nLATEXBLOCK${latexBlocks.length-1}END\n`});seg=seg.replace(/\\\(([\s\S]*?)\\\)/g,(_,f)=>{latexBlocks.push({type:'inline',formula:f.trim()});return`LATEXINLINE${latexBlocks.length-1}END`});seg=seg.replace(/\$([^$\n]+?)\$/g,(_,f)=>{latexBlocks.push({type:'inline',formula:f.trim()});return`LATEXINLINE${latexBlocks.length-1}END`});return seg}// ★ 2026-10-14（治本修「回复里的 HTML 标签被吃掉」）：
+function renderMarkdown(text){if(!text)return'';if(typeof marked==='undefined')return fallbackMarkdown(text);const codeFragments=[];let codeIdx=0;// ★ 2026-10-23（修「4 反引号围栏被切错 → 代码块里显示 &lt;」）：
+    //   原来只认 3 个反引号，遇到 ````markdown 包 ```cpp 的合法写法会匹配错位，
+    //   把中间代码当普通文本转义，最后二次转义显示成 &lt;。
+    //   改用反向引用：围栏 3 个及以上、开闭数量必须一致。
+    const safeText=text.replace(/(`{3,})[\s\S]*?\1|`[^`\n]+`/g,m=>{codeFragments.push(m);return`\x00CODE${codeIdx++}\x00`});const latexBlocks=[];function protectFormulas(seg){seg=seg.replace(/\\\[([\s\S]*?)\\\]/g,(_,f)=>{latexBlocks.push({type:'block',formula:f.trim()});return`\nLATEXBLOCK${latexBlocks.length-1}END\n`});seg=seg.replace(/(?:^|\n)\s*\$\$\s*([\s\S]*?)\s*\$\$\s*(?=\n|$)/g,(_,f)=>{latexBlocks.push({type:'block',formula:f.trim()});return`\nLATEXBLOCK${latexBlocks.length-1}END\n`});seg=seg.replace(/\\\(([\s\S]*?)\\\)/g,(_,f)=>{latexBlocks.push({type:'inline',formula:f.trim()});return`LATEXINLINE${latexBlocks.length-1}END`});seg=seg.replace(/\$([^$\n]+?)\$/g,(_,f)=>{latexBlocks.push({type:'inline',formula:f.trim()});return`LATEXINLINE${latexBlocks.length-1}END`});return seg}// ★ 2026-10-14（治本修「回复里的 HTML 标签被吃掉」）：
 //   marked 默认**不转义原始 HTML** —— 源文本里的 <title>/<b>/<div> 会被当真实标签解析，
 //   <title> 更是文档级元素会被移出内容流，导致后面的文字整段消失（用户实测 Output: <title>）。
 //   这里把源文本里的尖括号转义成实体：原始标签显示为字面量，而 markdown 语法照常渲染。
@@ -2501,7 +2505,24 @@ function renderMarkdown(text){if(!text)return'';if(typeof marked==='undefined')r
 //   浏览器显示为字面量 <title> 且不会被解析为标签；
 //   而 `>` 必须保持原样，否则 markdown 的 `>` 引用语法（blockquote）会失效。
 function _escRawHtml(t){return String(t).replace(/</g,'&lt;')}
-let processedText=_escRawHtml(linkifyBareText(protectFormulas(safeText)));processedText=processedText.replace(/\x00CODE(\d+)\x00/g,(_,i)=>codeFragments[i]);let html=marked.parse(processedText);html=html.replace(/LATEXBLOCK(\d+)END/g,(_,idx)=>{const item=latexBlocks[idx];return item?`<span class="math-block" data-formula="$$${escapeHtml(item.formula)}$$"></span>`:''}).replace(/LATEXINLINE(\d+)END/g,(_,idx)=>{const item=latexBlocks[idx];return item?`<span class="math-inline" data-formula="$${escapeHtml(item.formula)}$"></span>`:''});return html}
+// ★ 2026-10-23（治本）：不再预先转义全文，改由 marked 把原始 HTML 当**字面量**输出。
+//   原因：预转义只保护了「```围栏 / 行内代码」，4 空格或 Tab 缩进的代码块保护不到，
+//        一旦漏掉就会被转两次（用户实测代码块里显示 &lt;）。
+//   现在：代码块全交给 marked 自己转义（它只转一次，显示即原文）；
+//        正文里的原始 HTML 由下面覆盖的 html 渲染器转义成字面量，
+//        既不会被当标签解析，也不会重演 <title> 吃掉后文的旧问题。
+function _mdEscLiteral(t){return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+let _MD_OPTS=null;
+try{
+    const _r=new marked.Renderer();
+    // marked v9：html 渲染器收 token（个别版本直接给字符串），两种都兼容
+    _r.html=function(tok){
+        const raw=(typeof tok==='string')?tok:((tok&&(tok.text||tok.raw))||'');
+        return _mdEscLiteral(raw);
+    };
+    _MD_OPTS={renderer:_r};
+}catch(e){ _MD_OPTS=null; }
+let processedText=linkifyBareText(protectFormulas(safeText));processedText=processedText.replace(/\x00CODE(\d+)\x00/g,(_,i)=>codeFragments[i]);let html=marked.parse(processedText,_MD_OPTS||undefined);html=html.replace(/LATEXBLOCK(\d+)END/g,(_,idx)=>{const item=latexBlocks[idx];return item?`<span class="math-block" data-formula="$$${escapeHtml(item.formula)}$$"></span>`:''}).replace(/LATEXINLINE(\d+)END/g,(_,idx)=>{const item=latexBlocks[idx];return item?`<span class="math-inline" data-formula="$${escapeHtml(item.formula)}$"></span>`:''});return html}
 // ★ 挂到 window：便于控制台/注入脚本调用（脚本作用域的函数不一定可见）
 window.renderMarkdown = renderMarkdown;
 function renderLatex(c){if(!c||typeof katex==='undefined')return;const nodes=c.querySelectorAll('.math-block,.math-inline');if(!nodes.length)return;nodes.forEach(s=>{const isBlock=s.classList.contains('math-block');const raw=s.dataset.formula||'';let formula='';if(isBlock){const m=raw.match(/^\$\$([\s\S]*?)\$\$$/);if(m)formula=m[1]}else{const m=raw.match(/^\$([^$]+)\$$/);if(m)formula=m[1]}if(!formula)return;const ks=document.createElement('span');try{katex.render(formula,ks,{displayMode:isBlock,throwOnError:false})}catch(e){ks.textContent=raw}s.replaceWith(ks)})}
@@ -2975,7 +2996,8 @@ function escapeHtmlText(t){
 //   正确做法与正式回复一致：**先转义原始 HTML，再交给 marked** ——
 //     · markdown 语法（加粗/列表/标题/代码）照常渲染
 //     · 原始 HTML 标签显示为字面量（不会被当标签解析）
-//   实现上直接复用 renderMarkdown：它内部已有 `_escRawHtml(linkifyBareText(protectFormulas(safeText)))`。
+//   实现上直接复用 renderMarkdown：它内部用标记为字面量的 html 渲染器（_MD_OPTS）
+//   转义原始 HTML，而代码块（围栏 / 缩进 / 行内）交给 marked 自己转义 —— 只转一次。
 function renderReasoningMarkdown(text){
     try{
         if(typeof renderMarkdown === 'function') return renderMarkdown(text);
@@ -3003,7 +3025,7 @@ function updateReasoningDom(el,getFullText,force,noCode){
     //   但**绝不提前设置 _lastSrc**——否则一旦本次渲染被节流延后（或元素刚建好还没渲染），
     //   下一次调用就会因为 _lastSrc 已等于全文而直接返回，思考框永久为空。
     // ★ 2026-10-14（按用户反馈恢复 Markdown）：思考仍走 markdown 渲染，
-    //   但 renderMarkdown 内部会**先转义原始 HTML**（_escRawHtml），
+    //   但 renderMarkdown 内部会把原始 HTML 当字面量转义（_MD_OPTS 的 html 渲染器），
     //   所以既保留格式、又不会被 <title> 之类的标签吃掉内容。
     if(el._lastSrc===fullText && el._lastHtml!==undefined)return;
     const newHtml=renderReasoningMarkdown(fullText);
@@ -3194,6 +3216,39 @@ function renderFileCardsInBubble(text) {
 
 // 文件上传（📎 一个入口同时支持文档与图片；图片进入对话的图像理解，也上传一份供文件查看器打开）
 let pendingFiles=[],pendingImages=[],fileNames=[];try{fileNames=JSON.parse(localStorage.getItem(FILE_NAMES_KEY)||'[]')}catch(e){fileNames=[]}
+// ★ 2026-10-30：每个节点 / 每种模式各自一份**内存态**输入草稿。
+//   以前全站共用一个发送框：在一个节点里打了一半，切到别的节点/模式就串了或丢了。
+//   现在按 key 暂存（'__op__' = 操作模式，其余为对话节点 id），切回来原样恢复。
+//   ★ 按用户决定：**不持久化**（pendingFiles 里是浏览器 File 对象，无法序列化）。
+const _inputDrafts = new Map();
+let _inputDraftKey = null;
+function _draftKey(){
+    return currentMode === 'operation' ? '__op__' : (selectedNodeId || '__chat_none__');
+}
+function _stashInput(){
+    if(_inputDraftKey === null) return;          // 尚未绑定过，不用存
+    _inputDrafts.set(_inputDraftKey, {
+        text: userInput.value,
+        files: pendingFiles.slice(),
+        images: pendingImages.slice()
+    });
+}
+function _restoreInput(){
+    const k = _draftKey();
+    _inputDraftKey = k;
+    const d = _inputDrafts.get(k) || { text:'', files:[], images:[] };
+    try{
+        userInput.value = d.text || '';
+        userInput.style.height = 'auto';
+        userInput.style.height = Math.min(120, userInput.scrollHeight) + 'px';
+        pendingFiles = (d.files || []).slice();
+        pendingImages = (d.images || []).slice();
+        renderFileList();
+    }catch(e){}
+}
+function _clearInputDraft(){
+    try{ _inputDrafts.delete(_draftKey()); }catch(e){}
+}
 const uploadBtn=document.getElementById('uploadBtn'),fileInput=document.getElementById('fileInput'),fileListContainer=document.getElementById('fileList'),userInput=document.getElementById('userInput'),fileViewer=document.getElementById('fileViewer'),fileViewerTitle=document.getElementById('fileViewerTitle'),fileViewerContent=document.getElementById('fileViewerContent'),fileViewerClose=document.getElementById('fileViewerClose');
 const MAX_IMAGE_BYTES=32*1024*1024;   // 官方限制：单张图片最大 32 MiB
 const IMAGE_MIME_RE=/^image\/(jpeg|png|gif|webp)$/i;
@@ -3495,6 +3550,43 @@ function syncThinkingLevelFromState(){
 
 const messagesArea=document.getElementById('messagesArea'),sendBtn=document.getElementById('sendBtn'),modeSelect=document.getElementById('modeSelect'),treeContainer=document.getElementById('treeContainer'),treePlaceholder=document.getElementById('treePlaceholder'),exportBtn=document.getElementById('exportBtn'),importBtn=document.getElementById('importBtn'),importFile=document.getElementById('importFile'),thinkingToggle=document.getElementById('thinkingToggle'),modeIndicator=document.getElementById('modeIndicator'),treeFullscreenBtn=document.getElementById('treeFullscreenBtn'),treeHeader=document.getElementById('treeHeader'),searchArea=document.getElementById('searchArea'),settingsContainer=document.getElementById('settingsContainer'),sidebar=document.getElementById('sidebar'),searchInput=document.getElementById('searchInput'),searchBtnEl=document.getElementById('searchBtn'),clearSearchBtn=document.getElementById('clearSearchBtn'),searchTitleCheck=document.getElementById('searchTitle'),searchUserMsgCheck=document.getElementById('searchUserMsg'),searchAssistantMsgCheck=document.getElementById('searchAssistantMsg'),searchAllNodesCheck=document.getElementById('searchAllNodes'),searchResultsDiv=document.getElementById('searchResults'),importExportSection=document.getElementById('importExportSection'),clearOpBtn=document.getElementById('clearOpBtn'),searchTrigger=document.getElementById('searchTrigger'),inputArea=document.getElementById('inputArea');
 messagesArea.addEventListener('scroll',()=>{userScrolledUp=messagesArea.scrollHeight-messagesArea.scrollTop-messagesArea.clientHeight>=10});
+// ★ 2026-10-30：两个模式的**消息区互相隔离**
+//   以前共用 messagesArea：切模式就 innerHTML='' 清空（切回来内容全没），
+//   而对话树异步加载完成后又往同一块写（对话记录会跑进操作模式）。
+//   现在切换时把整块 DOM 摘进 DocumentFragment 保存，切回原样挂回（事件监听随节点保留）。
+let _modeAreaSave = { chat: null, operation: null };
+function _detachArea(){
+    const frag = document.createDocumentFragment();
+    while(messagesArea.firstChild) frag.appendChild(messagesArea.firstChild);
+    return frag;
+}
+function _restoreArea(mode){
+    while(messagesArea.firstChild) messagesArea.removeChild(messagesArea.firstChild);
+    const frag = _modeAreaSave[mode];
+    const has = !!(frag && frag.childNodes.length);
+    if(has) messagesArea.appendChild(frag);
+    return has;
+}
+// 操作模式的写入统一走这里：不在前台时塞进保存的片段，切回来就能看到
+function _opArea(){
+    if(currentMode==='operation') return messagesArea;
+    if(!_modeAreaSave.operation) _modeAreaSave.operation = document.createDocumentFragment();
+    return _modeAreaSave.operation;
+}
+// ★ 2026-10-30：路径"内容签名" —— 周期同步据此判断要不要重绘。
+//   之前用 `.some(n => !n.generating)` 判断，几乎永远为真 → 每 20 秒整块重绘，
+//   用户正在翻看历史时视口会被顶到底部（"神秘跳到底部"）。
+let _pathRenderSig = '';
+function _computePathSig(){
+    try{
+        const nodes = getPathNodes(selectedNodeId);
+        return nodes.map(n=>{
+            if(!n) return '';
+            return (n.id||'') + ':' + (n.generating?1:0) + ':' +
+                   ((n.assistantMessage||'').length) + ':' + ((n.reasoning||'').length);
+        }).join('|');
+    }catch(e){ return ''; }
+}
 // ★ 2026-09-21（性能，项13 配套）：滚动到底改为「按帧合并」。
 //   原实现每次调用都读 scrollHeight 再写 scrollTop —— 这是典型的读写交替强制同步布局
 //   （layout thrashing）。用真实导出记录做 CPU 采样时，该函数占了重放总耗时的约 40%
@@ -4138,8 +4230,50 @@ let searchActive=false;
 function toggleSearch(){searchActive=!searchActive;if(searchActive){settingsContainer.style.display='none';searchArea.style.display='flex';searchInput.focus()}else{settingsContainer.style.display='flex';searchArea.style.display='none';clearSearch()}}
 searchTrigger.addEventListener('click',toggleSearch);
 document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='f'){if(currentMode!=='chat')return;e.preventDefault();if(!searchActive)toggleSearch();searchInput.focus()}});
-function performSearch(){const term=searchInput.value.trim();if(!term){clearSearch();return}currentSearchTerm=term;const nodesToSearch=searchAllNodesCheck.checked?Object.values(treeData.nodes):getPathNodes(selectedNodeId);const results=[];nodesToSearch.forEach(node=>{if(!node)return;if(searchTitleCheck.checked&&node.title&&node.title.includes(term))results.push({nodeId:node.id,type:'标题',match:highlightText(node.title,term)});if(searchUserMsgCheck.checked&&node.userMessage&&node.userMessage.includes(term))results.push({nodeId:node.id,type:'提问',match:highlightText(getSnippet(node.userMessage,term),term)});if(searchAssistantMsgCheck.checked&&node.assistantMessage&&node.assistantMessage.includes(term))results.push({nodeId:node.id,type:'回答',match:highlightText(getSnippet(node.assistantMessage,term),term)})});renderSearchResults(results);renderTree();renderPathMessages()}
-function renderSearchResults(results){searchResultsDiv.innerHTML='';if(results.length===0){searchResultsDiv.style.display='none';return}searchResultsDiv.style.display='block';results.slice(0,30).forEach(r=>{const div=document.createElement('div');div.className='search-result-item';div.innerHTML=`<span class="match-type">${r.type}:</span><span class="match-text">${r.match}</span>`;div.addEventListener('click',()=>goToNode(r.nodeId));searchResultsDiv.appendChild(div)})}
+// ★ 2026-10-30（修「搜不到正文」）：/api/tree 只返回元数据（无 userMessage/assistantMessage），
+//   原来在这里用 node.userMessage.includes(term) 判断，永远是 undefined → 内容搜索不可能命中。
+//   现在改为**服务端搜索**（/api/search 在内存树里扫，527 节点毫秒级），
+//   并保留本地标题搜索作为接口失败时的降级方案。
+async function performSearch(){
+    const term=searchInput.value.trim();
+    if(!term){clearSearch();return}
+    currentSearchTerm=term;
+    const fields=[];
+    if(searchTitleCheck.checked)fields.push('title');
+    if(searchUserMsgCheck.checked)fields.push('user');
+    if(searchAssistantMsgCheck.checked)fields.push('answer');
+    if(!fields.length){renderSearchResults([]);renderTree();renderPathMessages();return}
+    const scope=searchAllNodesCheck.checked?'all':'path';
+    let results=null;
+    try{
+        const url=`${BASE_URL}/api/search?q=${encodeURIComponent(term)}&scope=${scope}`
+                 +`&fields=${encodeURIComponent(fields.join(','))}`
+                 +`&node_id=${encodeURIComponent(selectedNodeId||'')}`;
+        const r=await fetch(url);const j=await r.json();
+        if(j&&j.success&&Array.isArray(j.results)){
+            results=j.results.map(x=>({nodeId:x.nodeId,type:x.type,
+                                       match:highlightText(x.snippet||'',term)}));
+            searchTotal=(j.total||results.length);
+        }
+    }catch(e){console.warn('[SEARCH] 服务端搜索失败，降级为本地标题搜索',e)}
+    if(results===null){
+        // 降级：只能用本地已有数据（基本上只有标题）
+        results=[];
+        const pool=searchAllNodesCheck.checked?Object.values(treeData.nodes):getPathNodes(selectedNodeId);
+        pool.forEach(node=>{if(!node)return;
+            if(searchTitleCheck.checked&&node.title&&node.title.includes(term))
+                results.push({nodeId:node.id,type:'标题',match:highlightText(node.title,term)});
+            if(searchUserMsgCheck.checked&&node.userMessage&&node.userMessage.includes(term))
+                results.push({nodeId:node.id,type:'提问',match:highlightText(getSnippet(node.userMessage,term),term)});
+            if(searchAssistantMsgCheck.checked&&node.assistantMessage&&node.assistantMessage.includes(term))
+                results.push({nodeId:node.id,type:'回答',match:highlightText(getSnippet(node.assistantMessage,term),term)});
+        });
+        searchTotal=results.length;
+    }
+    renderSearchResults(results);renderTree();renderPathMessages()
+}
+let searchTotal=0;   // 服务端返回的总命中数（列表只显示前 30 条）
+function renderSearchResults(results){searchResultsDiv.innerHTML='';if(results.length===0){searchResultsDiv.style.display='block';searchResultsDiv.innerHTML=`<div style="padding:8px 10px;color:var(--tx-muted);font-size:0.78rem;">未找到「${escapeHtml(currentSearchTerm||'')}」</div>`;return}searchResultsDiv.style.display='block';if(searchTotal>results.length){const hd=document.createElement('div');hd.style.cssText='padding:4px 10px;color:var(--tx-muted);font-size:0.72rem;';hd.textContent=`共 ${searchTotal} 条匹配，显示前 ${Math.min(30,results.length)} 条`;searchResultsDiv.appendChild(hd)}results.slice(0,30).forEach(r=>{const div=document.createElement('div');div.className='search-result-item';div.innerHTML=`<span class="match-type">${r.type}:</span><span class="match-text">${r.match}</span>`;div.addEventListener('click',()=>goToNode(r.nodeId));searchResultsDiv.appendChild(div)})}
 function clearSearch(){currentSearchTerm='';searchInput.value='';searchResultsDiv.style.display='none';searchResultsDiv.innerHTML='';renderTree();renderPathMessages()}
 searchBtnEl.addEventListener('click',performSearch);clearSearchBtn.addEventListener('click',()=>{clearSearch();toggleSearch()});searchInput.addEventListener('keydown',e=>{if(e.key==='Enter')performSearch()});
 
@@ -4155,7 +4289,7 @@ function handleNodeCompletion(nodeId){
     refreshTitleStatus();
     // 只在对话模式下才刷新界面
     if (currentMode === 'chat') {
-        if(selectedNodeId === nodeId || getPathNodes(selectedNodeId).includes(nodeId)) {
+        if(selectedNodeId === nodeId || getPathNodes(selectedNodeId).some(n=>n.id===nodeId)) {
             renderPathMessages();
         }
         renderTree();
@@ -4181,7 +4315,9 @@ async function goToNode(nodeId) {
         }
     } catch (e) {}
     
+    _stashInput();
     selectedNodeId = nodeId;
+    _restoreInput();
     localStorage.setItem(LAST_NODE_KEY, nodeId);
     renderTree();
     renderPathMessages();   // 现在可以显示消息内容了
@@ -4398,7 +4534,11 @@ function buildUsageText(u, modelName, effortLabel) {
     const ctxPct = (ctx / 1000000 * 100).toFixed(2);
     return `🤖 模型：${modelLabel} 🧩 思考深度：${effortLabel} 📊 累计输入: ${prompt.toLocaleString()} tokens (缓存命中率 ${hitRate}%) | 输出: ${completion.toLocaleString()} tokens | 费用: ${fmtCost(costs)} | 上下文占用率: ${ctxPct}%`;
 }
-async function renderPathMessages(){messagesArea.innerHTML='';if(!selectedNodeId)return;const pathIds=[];let cur=selectedNodeId;while(cur){pathIds.unshift(cur);cur=treeData.nodes[cur]?.parentId}const _missing=pathIds.filter(nid=>{const n=treeData.nodes[nid];return !n||(n.userMessage===undefined&&!n.generating)});if(_missing.length){await Promise.all(_missing.map(async nid=>{try{const res=await fetch(`${BASE_URL}/api/node/${nid}`);if(res.ok){const full=await res.json();if(full&&!full.error){if(!treeData.nodes[nid])treeData.nodes[nid]=full;else Object.assign(treeData.nodes[nid],full);}}}catch(e){}}));}pathIds.forEach(nid=>{const node=treeData.nodes[nid];if(!node)return;const userDiv=document.createElement('div');userDiv.className='message user-msg';const _tx = currentSearchTerm&&searchUserMsgCheck.checked ? (s)=>highlightText(s,currentSearchTerm) : null;userDiv.innerHTML=`<div class="bubble">${buildUserBubbleInner(node.userMessage, node.images, _tx)}</div>`;messagesArea.appendChild(userDiv);const assistantDiv=document.createElement('div');assistantDiv.className='message assistant-msg';assistantDiv.id='msg-'+nid;const bubbleDiv=document.createElement('div');bubbleDiv.className='bubble markdown-body';if(!node.generating&&(node.reasoning||node.assistantMessage)){if(node.reasoning){const rs=document.createElement('div');rs.className=rsCls();rs.innerHTML=`<div class="reasoning-header"><span>🧠 思考过程${(node.stopReason==='user_stop'||node.stopReason==='error')?'<span style="font-size:0.7rem;color:var(--tx-muted);font-weight:400;">（已中断）</span>':''}</span><span class="reasoning-duration">${node.reasoningDuration?node.reasoningDuration+'s':''}</span><span>${rsArrow()}</span></div><div class="${rscCls()}">${renderReasoningMarkdown(node.reasoning)}</div>`;bubbleDiv.appendChild(rs)}const ans=document.createElement('div');ans.className='answer-content';
+async function renderPathMessages(){if(currentMode!=='chat')return;   // ★ 防止切走后迟到的渲染写进操作模式
+// 重绘前的滚动状态（回到原版语义：重绘后回到底部）
+const _sc0={t:messagesArea.scrollTop,h:messagesArea.scrollHeight,c:messagesArea.clientHeight};
+_sc0.atBottom=(_sc0.h-_sc0.t-_sc0.c)<=12;
+messagesArea.innerHTML='';if(!selectedNodeId)return;const pathIds=[];let cur=selectedNodeId;while(cur){pathIds.unshift(cur);cur=treeData.nodes[cur]?.parentId}const _missing=pathIds.filter(nid=>{const n=treeData.nodes[nid];return !n||(n.userMessage===undefined&&!n.generating)});if(_missing.length){await Promise.all(_missing.map(async nid=>{try{const res=await fetch(`${BASE_URL}/api/node/${nid}`);if(res.ok){const full=await res.json();if(full&&!full.error){if(!treeData.nodes[nid])treeData.nodes[nid]=full;else Object.assign(treeData.nodes[nid],full);}}}catch(e){}}));}pathIds.forEach(nid=>{const node=treeData.nodes[nid];if(!node)return;const userDiv=document.createElement('div');userDiv.className='message user-msg';const _tx = currentSearchTerm&&searchUserMsgCheck.checked ? (s)=>highlightText(s,currentSearchTerm) : null;userDiv.innerHTML=`<div class="bubble">${buildUserBubbleInner(node.userMessage, node.images, _tx)}</div>`;messagesArea.appendChild(userDiv);const assistantDiv=document.createElement('div');assistantDiv.className='message assistant-msg';assistantDiv.id='msg-'+nid;const bubbleDiv=document.createElement('div');bubbleDiv.className='bubble markdown-body';if(!node.generating&&(node.reasoning||node.assistantMessage)){if(node.reasoning){const rs=document.createElement('div');rs.className=rsCls();rs.innerHTML=`<div class="reasoning-header"><span>🧠 思考过程${(node.stopReason==='user_stop'||node.stopReason==='error')?'<span style="font-size:0.7rem;color:var(--tx-muted);font-weight:400;">（已中断）</span>':''}</span><span class="reasoning-duration">${node.reasoningDuration?node.reasoningDuration+'s':''}</span><span>${rsArrow()}</span></div><div class="${rscCls()}">${renderReasoningMarkdown(node.reasoning)}</div>`;bubbleDiv.appendChild(rs)}const ans=document.createElement('div');ans.className='answer-content';
 // ★ 2026-10-23：本轮没有回答时给明确提示，不要留一个空白气泡
 //   （用户实测：思考断了半句 + 下面全空，看着像坏了，实际是被「停止生成」取消）。
 if(node.assistantMessage && node.assistantMessage.length){
@@ -4412,7 +4552,9 @@ if(node.assistantMessage && node.assistantMessage.length){
 }
 bubbleDiv.appendChild(ans);if(node.usage){const usageDiv=document.createElement('div');usageDiv.className='usage-info';const prompt=node.usage.prompt_tokens||0,completion=node.usage.completion_tokens||0,cached=node.usage.cached_tokens||0;const costs=getDetailedCost(node.model||'deepseek-v4-flash',cached,prompt-cached,completion,node.usage.ts||node.usageAt||node.createdAt||Date.now()/1000);const modelLabel=modelLabelOf(node.model);// ★ 2026-10-14：关思考时显示 Off（节点未记录 effort 时按高/中判断）
 // ★ 2026-10-14：复用统一的档位映射（原来这里漏了 low，low 会落进 'High'）
-const reasonLabel=thinkingLevelLabel(node.thinkingEnabled, node.reasoningEffort);usageDiv.innerHTML=`🤖 模型：${modelLabel}  🧩 思考深度：${reasonLabel}  📊 输入(缓存命中): ${cached} tokens | 输入(未命中): ${prompt-cached} tokens | 输出: ${completion} tokens | 费用: ¥${costs.total.toFixed(6)}`;bubbleDiv.appendChild(usageDiv)}enhanceBubble(bubbleDiv,node.assistantMessage||'')}else{const ans=document.createElement('div');ans.className='answer-content';bubbleDiv.appendChild(ans)}assistantDiv.appendChild(bubbleDiv);messagesArea.appendChild(assistantDiv);if(node.generating){if(!pollingTimers[nid])pollNode(nid);startStream(nid)}});bindReasoningToggles(messagesArea);enhanceLinks(messagesArea);refreshProcFold();userScrolledUp=false;smartScrollToBottom()}
+const reasonLabel=thinkingLevelLabel(node.thinkingEnabled, node.reasoningEffort);usageDiv.innerHTML=`🤖 模型：${modelLabel}  🧩 思考深度：${reasonLabel}  📊 输入(缓存命中): ${cached} tokens | 输入(未命中): ${prompt-cached} tokens | 输出: ${completion} tokens | 费用: ¥${costs.total.toFixed(6)}`;bubbleDiv.appendChild(usageDiv)}enhanceBubble(bubbleDiv,node.assistantMessage||'')}else{const ans=document.createElement('div');ans.className='answer-content';bubbleDiv.appendChild(ans)}assistantDiv.appendChild(bubbleDiv);messagesArea.appendChild(assistantDiv);if(node.generating){if(!pollingTimers[nid])pollNode(nid);startStream(nid)}});bindReasoningToggles(messagesArea);enhanceLinks(messagesArea);refreshProcFold();
+// 回到原版：重绘后回到底部（周期同步已不再重绘，不会打断阅读）
+userScrolledUp=false;smartScrollToBottom()}
 function appendUserMessage(text){const div=document.createElement('div');div.className='message user-msg';div.innerHTML=`<div class="bubble">${escapeHtml(text)}</div>`;messagesArea.appendChild(div);smartScrollToBottom()}
 // ★ 用户气泡内联构建：图片缩略图 + 文件卡片作为附件行，显示在用户询问文字上方
 function extractFileCards(text){
@@ -4472,7 +4614,7 @@ function createAssistantMessageContainer() {
     //   内容可能是异步（节流渲染）到达的，刚建出来时框是空的，
     //   若此时被当空框删掉，界面就会「少一个框」（用户实测的实时渲染问题）。
     try{ container.__bornAt = Date.now(); }catch(e){}
-    messagesArea.appendChild(container);
+    _opArea().appendChild(container);
     smartScrollToBottom();
     bindReasoningToggles(container);
     return {
@@ -4754,6 +4896,7 @@ async function sendMessage() {
         pendingImages = [];
         renderFileList();
         userInput.value = '';
+        _clearInputDraft();
         userInput.style.height = 'auto';
 
         // 按当前模式分发
@@ -4772,6 +4915,7 @@ async function sendMessage() {
     userInput.style.height = 'auto';
     pendingImages = [];
     renderFileList();
+    _clearInputDraft();
 
     if (currentMode === 'operation') {
         sendOperationMessage(text, imagesToSend);
@@ -4803,7 +4947,7 @@ async function processChatMessage(userText, files = [], images = []) {
 }
 sendBtn.addEventListener('click', sendMessage);
 userInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
-userInput.addEventListener('input', function() { this.style.height = 'auto'; this.style.height = Math.min(120, this.scrollHeight) + 'px'; });
+userInput.addEventListener('input', function() { this.style.height = 'auto'; this.style.height = Math.min(120, this.scrollHeight) + 'px'; _stashInput(); });
 
 // ★ 2026-10-04（按用户反馈「重启后用量/耗时数据减少了」）：
 //   复用**导入/导出那套机制**，不再自己造统计口径。
@@ -5124,7 +5268,7 @@ function _umFingerprint(s){
 function claimUserBubble(content){
     try{
         const fp = _umFingerprint(content);
-        const list = messagesArea.querySelectorAll('.user-msg[data-umtext][data-umclaimed="0"]');
+        const list = _opArea().querySelectorAll('.user-msg[data-umtext][data-umclaimed="0"]');
         for(const el of list){
             if(el.dataset.umtext === fp){ el.dataset.umclaimed = '1'; return true; }
         }
@@ -5139,7 +5283,7 @@ function appendUserBubble(content, images, claimed){    const div = document.cre
         div.dataset.umtext = _umFingerprint(content);
         div.dataset.umclaimed = claimed ? '1' : '0';
     }catch(e){}
-    messagesArea.appendChild(div);
+    _opArea().appendChild(div);
     smartScrollToBottom();
     return div;
 }
@@ -7147,7 +7291,7 @@ function insertReplayUserBubble(text, containerRef, images){
     // ★ 2026-10-12：图片交给 buildUserBubbleInner 统一渲染（它内部已调
     //   buildImportedImagesHtml）。这里再调一次会重复渲染出两张图。
     userDiv.innerHTML=`<div class="bubble">${buildUserBubbleInner(text, images)}</div>`;
-    messagesArea.appendChild(userDiv);
+    _opArea().appendChild(userDiv);
     try{
         const c=containerRef&&containerRef.container;
         if(c && c.isConnected && c.parentNode===messagesArea && c!==userDiv){
@@ -7160,7 +7304,7 @@ function insertReplayUserBubble(text, containerRef, images){
                     if((rc.textContent||'').trim()!=='')hasContent=true;
                 });
             }
-            if(!hasContent) messagesArea.appendChild(c);   // 移到最后 = 用户气泡之后
+            if(!hasContent) _opArea().appendChild(c);   // 移到最后 = 用户气泡之后
         }
     }catch(e){}
     smartScrollToBottom();
@@ -7555,7 +7699,7 @@ async function importOperationFile(file) {
     linearMessages = [{ role: 'system', content: 'You are a helpful assistant.' }].concat(injectedMsgs);
 
     // 重放事件还原界面
-    messagesArea.innerHTML = '';
+    _opArea().innerHTML = '';
     operationTranscript = data.events.slice();
     // ★ 会话属性：导入的是“新会话”，清掉上一会话的自定义标题与缓存
     operationTitleOverride = null;
@@ -7664,7 +7808,7 @@ async function importOperationFile(file) {
         const importedNote = document.createElement('div');
         importedNote.className = 'message assistant-msg';
         importedNote.innerHTML = `<div class="bubble">📥 已导入操作记录（${data.events.length} 个事件），上下文已注入服务器，可继续追问。</div>`;
-        messagesArea.appendChild(importedNote);
+        _opArea().appendChild(importedNote);
         smartScrollToBottom();
         // ★ 2026-10-14：回放 + 提示都已落地，再延后一拍解除导入闸门 ——
         //   给"被取消会话的在途事件"一点时间落空，避免它们插到提示后面；
@@ -7684,7 +7828,7 @@ async function importOperationFile(file) {
 }
 
 // 模式切换
-modeSelect.addEventListener('change',()=>{currentMode=modeSelect.value;document.querySelectorAll('.agent-panel.fullscreen').forEach(p=>{p.classList.remove('fullscreen');const c=p.querySelector('.panel-fs-close');if(c)c.remove();});if(currentMode==='chat'){if(smOpen)smClosePanel();smOpenBtn.style.display='none';clearOpBtn.style.display='none';updateStopBtnLabel();document.getElementById('agentStatus').style.display='none';try{updateAgentVersionWarn(_lastAgentVersion);}catch(e){}document.getElementById('agentPanel').style.display='none';document.getElementById('processPanel').style.display='none';document.getElementById('planPanel').style.display='none';currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();clearAskQuestions();treeContainer.style.display='block';searchTrigger.style.display='';chatSettingsTrigger.style.display='';opSettingsTrigger.style.display='none';sessionInfoTrigger.style.display='none';searchArea.style.display='none';settingsContainer.style.display='flex';searchActive=false;treeHeader.style.display='flex';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出';importBtn.textContent='⬆️ 导入';inputArea.style.display='flex';messagesArea.innerHTML='';hideActivationWizard();closeSessionInfo();loadTree()}else{smOpenBtn.style.display='flex';clearOpBtn.style.display='inline-block';updateStopBtnLabel();document.getElementById('agentStatus').style.display='block';try{updateAgentVersionWarn(_lastAgentVersion);}catch(e){}document.getElementById('agentPanel').style.display='flex';document.getElementById('processPanel').style.display='flex';document.getElementById('planPanel').style.display='flex';renderAskPanel();currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();treeContainer.style.display='none';searchTrigger.style.display='none';chatSettingsTrigger.style.display='none';opSettingsTrigger.style.display='';sessionInfoTrigger.style.display='';searchArea.style.display='none';settingsContainer.style.display='flex';treeHeader.style.display='none';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出操作';importBtn.textContent='⬆️ 导入操作';operationTranscript=[];operationMeta={model:'',reasoning_effort:'',thinking_enabled:true,session_id:null};if(agentAvailable){inputArea.style.display='flex';operationChatInitialized=true;messagesArea.innerHTML='<div class="message assistant-msg"><div class="bubble">🖥️ 操作模式已激活</div></div>';linearMessages=[{role:"system",content:"You are a helpful assistant."}]}else{inputArea.style.display='none';showActivationWizard()}}updateModeIndicator()});
+modeSelect.addEventListener('change',()=>{const _prevMode=currentMode;_stashInput();currentMode=modeSelect.value;document.querySelectorAll('.agent-panel.fullscreen').forEach(p=>{p.classList.remove('fullscreen');const c=p.querySelector('.panel-fs-close');if(c)c.remove();});if(currentMode==='chat'){if(smOpen)smClosePanel();smOpenBtn.style.display='none';clearOpBtn.style.display='none';updateStopBtnLabel();document.getElementById('agentStatus').style.display='none';try{updateAgentVersionWarn(_lastAgentVersion);}catch(e){}document.getElementById('agentPanel').style.display='none';document.getElementById('processPanel').style.display='none';document.getElementById('planPanel').style.display='none';currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();clearAskQuestions();treeContainer.style.display='block';searchTrigger.style.display='';chatSettingsTrigger.style.display='';opSettingsTrigger.style.display='none';sessionInfoTrigger.style.display='none';searchArea.style.display='none';settingsContainer.style.display='flex';searchActive=false;treeHeader.style.display='flex';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出';importBtn.textContent='⬆️ 导入';inputArea.style.display='flex';if(_prevMode==='operation')_modeAreaSave.operation=_detachArea();_restoreArea('chat');hideActivationWizard();closeSessionInfo();_restoreInput();loadTree()}else{smOpenBtn.style.display='flex';clearOpBtn.style.display='inline-block';updateStopBtnLabel();document.getElementById('agentStatus').style.display='block';try{updateAgentVersionWarn(_lastAgentVersion);}catch(e){}document.getElementById('agentPanel').style.display='flex';document.getElementById('processPanel').style.display='flex';document.getElementById('planPanel').style.display='flex';renderAskPanel();currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();treeContainer.style.display='none';searchTrigger.style.display='none';chatSettingsTrigger.style.display='none';opSettingsTrigger.style.display='';sessionInfoTrigger.style.display='';searchArea.style.display='none';settingsContainer.style.display='flex';treeHeader.style.display='none';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出操作';importBtn.textContent='⬆️ 导入操作';if(_prevMode==='chat')_modeAreaSave.chat=_detachArea();const _opHad=_restoreArea('operation');if(!Array.isArray(operationTranscript))operationTranscript=[];if(!operationMeta||typeof operationMeta!=='object')operationMeta={model:'',reasoning_effort:'',thinking_enabled:true,session_id:null};if(agentAvailable){inputArea.style.display='flex';_restoreInput();if(!_opHad&&!operationChatInitialized){operationChatInitialized=true;_opArea().innerHTML='<div class="message assistant-msg"><div class="bubble">🖥️ 操作模式已激活</div></div>';}}else{inputArea.style.display='none';showActivationWizard()}}updateModeIndicator()});
 // ==================== 会话属性面板（操作模式 💬 按钮） ====================
 // 展示：标题（可改，同时作为导出文件名） / 时间（忙碌·LLM·工具·等提问·首token·输出速度）
 //       用量（★ 按模型分开计费：Flash 与 Pro 各用各自单价） / 上下文占用组成部分
@@ -8863,12 +9007,15 @@ function autosaveTitle(){
     else if(treeData&&selectedNodeId&&treeData.nodes[selectedNodeId]&&treeData.nodes[selectedNodeId].title&&treeData.nodes[selectedNodeId].title!=='新对话')title=treeData.nodes[selectedNodeId].title;
     return String(title).replace(/[\\/:*?"<>|\r\n\t]+/g,'_').replace(/^_+|_+$/g,'').slice(0,60)||'未命名';
 }
+// ★ 2026-11-01（按用户要求）：自动保存**不再加时间戳**，固定覆盖同一个文件。
+//   原因：以前每次自动保存都生成 `<标题>_20261101_150405.json`，
+//   实测堆出 server 7922 个 / 598MB、client 6958 个 / 386MB，同一标题几十份。
+//   现在只区分两类：
+//     自动保存 → `【自动保存】<标题>.json`（每轮覆盖）
+//     手动保存 → `<标题>.json`（不含前缀）
 function autosaveFileName(){
     const safe=autosaveTitle();
-    const d=new Date();
-    const pad=n=>String(n).padStart(2,'0');
-    const ts=`${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-    return `${safe}_${ts}.json`;
+    return `【自动保存】${safe}.json`;
 }
 function buildBackupPayload(){
     if(currentMode==='operation'){
@@ -9027,13 +9174,32 @@ window.finalizeStoppedTurn = finalizeStoppedTurn;
 //   → startStream 逐字渲染），跟操作模式的事件流完全是两套。
 //   所以停止要单独处理：停轮询、停逐字渲染、让服务端别再生成、然后收尾当前节点。
 async function stopChatGeneration(){
-    // 收集仍在生成的节点（通常只有当前这个）
-    const ids = Object.keys(pollingTimers || {});
-    const gen = Object.keys(treeData.nodes || {}).filter(id => {
+    // ★ 2026-10-30（修「点停止会把其它分支也停掉」）：
+    //   原来收集的是**全部** pollingTimers + **全部** generating 节点，
+    //   于是任何一处点「停止生成」，整棵树里所有在生成的分支一起死。
+    //   现在只停"用户当前正在看的那条路径"上的生成。
+    const pathNodes = getPathNodes(selectedNodeId || '');      // 节点对象数组
+    const pathIds = new Set(pathNodes.map(n => n && n.id).filter(Boolean));
+    const genAll = Object.keys(treeData.nodes || {}).filter(id => {
         const n = treeData.nodes[id];
         return n && n.generating;
     });
-    const targets = [...new Set([...ids, ...gen])];
+
+    // ① 当前路径上正在生成的
+    let targets = genAll.filter(id => pathIds.has(id));
+
+    // ② 当前路径没有（用户已切到别的分支）：只停**最新开始**的那一个，不动其它分支
+    if (!targets.length && genAll.length) {
+        genAll.sort((a, b) => ((treeData.nodes[b].createdAt || 0) - (treeData.nodes[a].createdAt || 0)));
+        targets = [genAll[0]];
+        console.log('[STOP] 当前路径上没有生成，改停最新开始的一个：' + targets[0]);
+    }
+
+    // ③ 兜底：当前路径上有轮询、但没有 generating 标记（状态不同步）
+    if (!targets.length) {
+        targets = Object.keys(pollingTimers || {}).filter(id => pathIds.has(id));
+    }
+
     if (!targets.length) {
         console.log('[STOP] 对话模式：没有正在生成的内容，忽略');
         return;                                  // ★ 没东西在跑 → 无反应
@@ -9055,7 +9221,7 @@ async function stopChatGeneration(){
     try {
         const last = targets[targets.length - 1];
         if (currentMode === 'chat') {
-            if (selectedNodeId === last || getPathNodes(selectedNodeId).includes(last)) renderPathMessages();
+            if (selectedNodeId === last || getPathNodes(selectedNodeId).some(n=>n.id===last)) renderPathMessages();
             renderTree();
         }
     } catch (e) {}
@@ -9331,7 +9497,7 @@ clearOpBtn.addEventListener('click', async () => {
     renderProcessList();
     currentSessionIdForTimer = null;
 
-    messagesArea.innerHTML = '<div class="message assistant-msg"><div class="bubble">🖥️ 操作记录已清空</div></div>';
+    _opArea().innerHTML = '<div class="message assistant-msg"><div class="bubble">🖥️ 操作记录已清空</div></div>';
     resetChildAgentState();
     clearAskQuestions();   // ★ 2026-09-21：同时清空问题视图
     // ★ 2026-09-29（按用户反馈「手动清空后不发消息，标题有时显示忙碌」）：
@@ -9476,9 +9642,12 @@ setInterval(async()=>{
         });
         treeData.root = fresh.root;
         renderTree();
-        if(selectedNodeId && getPathNodes(selectedNodeId).some(nid => treeData.nodes[nid] && !treeData.nodes[nid].generating)){
-            renderPathMessages();
-        }
+        // ★ 2026-11-01（按用户要求）：周期同步**不再重绘消息区**。
+        //   原来这里会 renderPathMessages()，把整个气泡区推倒重建 ——
+        //   代价是滚动位置漂移、高亮/公式重算、折叠闪动；收益几乎为零
+        //   （本页的生成由 pollNode 负责并在完成时自行重绘；别的标签页的变化极少）。
+        //   现在只同步左侧对话树与节点状态。
+
     }catch(e){}
         refreshTitleStatus();
 }, SYNC_INTERVAL);
@@ -9668,6 +9837,7 @@ async function loadTree() {
     try {
         const res = await fetch(`${BASE_URL}/api/tree`);
         treeData = await res.json();
+        if (currentMode !== 'chat') return;   // ★ 期间切走了：不要继续渲染
 
         Object.keys(treeData.nodes).forEach(nid => {
             if (treeData.nodes[nid].generating) pollNode(nid);

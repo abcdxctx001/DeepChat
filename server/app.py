@@ -624,8 +624,13 @@ def _plan_put(session_id, plan):
             sess["plan"] = plan
 
 def _mem_filename(title):
-    """把标题/文件名清理为安全的记忆文件名（强制 .json 后缀，防目录穿越）。"""
+    """把标题/文件名清理为安全的记忆文件名（强制 .json 后缀，防目录穿越）。
+
+    ★ 2026-11-01：顺带剥掉历史遗留的 `_YYYYMMDD_HHMMSS` 后缀 ——
+      以前自动保存每轮生成一个新文件，堆出上万个；现在固定覆盖，不再需要时间戳。
+    """
     name = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', str(title or 'untitled')).strip(' ._')
+    name = re.sub(r'_\d{8}_\d{6}$', '', name).strip(' ._')     # 去掉遗留时间戳
     if not name:
         name = 'untitled'
     if not name.lower().endswith('.json'):
@@ -1009,7 +1014,7 @@ class TreeManager:
                     if k in ('assistantMessage','reasoning','title','model',
                              'usage','reasoningDuration','reasoningEffort',
                              'generating','images','stopReason','finishReason',
-                             'thinkingEnabled'):
+                             'thinkingEnabled','files'):
                         node[k] = v
                 # ★ 用量计价以调用时间为准：写入 usage 时同时记录调用时间戳（峰谷定价）
                 if kw.get('usage') is not None:
@@ -1110,6 +1115,75 @@ def _file_ctx(files):
     return "".join(f"用户上传了文件 `{f['name']}`，内容如下：\n```\n{f['content']}\n```\n\n"
                    for f in files if isinstance(f, dict) and f.get('name'))
 
+# ---------- 节点文件继承（2026-10-30）----------
+# 背景：文件在 /api/upload 已落盘到 UPLOAD_FOLDER，file_map.json 记 显示名→存储名；
+#      但对话模式只在**当轮**把文件内容拼进 ctx，从不写进节点，
+#      于是后代节点（build_path_messages）拿不到文件，只能凭空猜。
+# 方案：节点只存 {name, file}（不存正文）；拼历史时按存储名重新解析并完整拼上。
+FILE_INJECT_MAX = 200 * 1024          # 单文件注入上限（防撑爆上下文），超出截断并标注
+
+
+def _stored_name_for(display_name, file_map=None):
+    """显示名 → 落盘存储名。取不到返回空串（静默）。"""
+    try:
+        fm = file_map if file_map is not None else load_file_map()
+        return fm.get(display_name) or ''
+    except Exception:
+        return ''
+
+
+def _parse_stored_file(sname):
+    """按落盘文件名重新解析出文本；返回 (text, error)。"""
+    if not sname:
+        return "", "no-name"
+    path = os.path.join(UPLOAD_FOLDER, sname)
+    if not os.path.exists(path):
+        return "", "missing"
+    ext = sname.rsplit('.', 1)[1].lower() if '.' in sname else ''
+    try:
+        if ext == 'pdf':
+            return parse_pdf(path) or "", ""
+        if ext in ('doc', 'docx'):
+            return parse_docx(path) or "", ""
+        if ext in ('xls', 'xlsx'):
+            return parse_xlsx(path) or "", ""
+        if ext in ('ppt', 'pptx'):
+            return parse_pptx(path) or "", ""
+        return parse_txt(path) or "", ""
+    except Exception as e:
+        return "", str(e)
+
+
+def _files_ctx_from_node(node):
+    """把节点记录的文件重新读出来拼成上下文文本。
+
+    文件缺失/解析失败 → **不抛错、不拒绝发送**，只告诉模型"不可用，请勿臆测"。
+    """
+    files = node.get("files") or []
+    if not files:
+        return ""
+    try:
+        fm = load_file_map()
+    except Exception:
+        fm = {}
+    out = []
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        name = f.get("name") or f.get("displayName") or "未命名文件"
+        sname = f.get("file") or _stored_name_for(name, fm)
+        text, err = _parse_stored_file(sname)
+        if not (text or "").strip():
+            out.append("（用户此前上传过文件 `%s`，但该文件当前不可用（%s），"
+                       "请勿臆测其内容；如确需，请让用户重新上传。）\n\n" % (name, err or "空内容"))
+            continue
+        text = text.strip()
+        if len(text) > FILE_INJECT_MAX:
+            text = text[:FILE_INJECT_MAX] + "\n…（内容过长，此处仅前 %dKB）" % (FILE_INJECT_MAX // 1024)
+        out.append("用户上传了文件 `%s`，内容如下：\n```\n%s\n```\n\n" % (name, text))
+    return "".join(out)
+
+
 def build_path_messages(node_id, tree):
     path, cur = [], node_id
     while cur:
@@ -1119,8 +1193,16 @@ def build_path_messages(node_id, tree):
         cur = node.get("parentId")
     msgs = []
     for n in path:
-        msgs.append({"role":"user","content":_build_user_content_with_images(n.get("userMessage") or "", n.get("images"))})
-        msgs.append({"role":"assistant","content":n["assistantMessage"]})
+        _u = n.get("userMessage") or ""
+        # ★ 该节点若有附件文件，按其记录重新解析并完整拼上（缺失则仅告知模型不可用）
+        try:
+            _fc = _files_ctx_from_node(n)
+        except Exception:
+            _fc = ""
+        if _fc:
+            _u = _fc + _u
+        msgs.append({"role":"user","content":_build_user_content_with_images(_u, n.get("images"))})
+        msgs.append({"role":"assistant","content":n.get("assistantMessage") or ""})
     return msgs
 
 # ---------- 文件解析 ----------
@@ -1774,6 +1856,11 @@ def autosave():
     if not isinstance(payload, dict):
         return jsonify({"success": False, "error": "缺少 payload"}), 400
     fname = d.get('fname') or (_mem_filename(f"{title}_autosave"))
+    # ★ 2026-11-01：自动保存一律带【自动保存】前缀（与手动保存区分），
+    #   老客户端就算还传时间戳名，也会被规范成同一个文件而覆盖。
+    fname = os.path.basename(str(fname))
+    if '【自动保存】' not in fname:
+        fname = '【自动保存】' + _mem_filename(os.path.splitext(fname)[0])
     fname = os.path.basename(fname)
     if not fname.lower().endswith('.json'):
         fname += '.json'
@@ -8309,6 +8396,22 @@ def chat():
     saved_images = _save_inline_images(images)
     if saved_images:
         update_node_in_tree(new_id, images=saved_images)
+    # ★ 附件文件：节点只记 {name, file=存储名}，正文留在 uploads 里，避免 chat_tree.json 暴涨。
+    #   这样后代节点也能通过 build_path_messages 重新读出来。
+    if files:
+        try:
+            _fm = load_file_map()
+            _saved_files = []
+            for _f in files:
+                if not isinstance(_f, dict):
+                    continue
+                _nm = _f.get('name') or _f.get('displayName') or ''
+                _sn = _stored_name_for(_nm, _fm)
+                _saved_files.append({"name": _nm, "file": _sn})
+            if _saved_files:
+                update_node_in_tree(new_id, files=_saved_files)
+        except Exception as _e:
+            logging.warning(f"[CHAT] 记录附件失败（不影响发送）: {_e}")
     tree = load_tree()
     ctx = []
     if tree_node_id and tree_node_id in tree["nodes"]:
@@ -8339,6 +8442,67 @@ def cancel_node():
     except Exception as e:
         logging.warning(f"[CHAT] 停止节点 {nid} 时更新状态失败: {e}")
     return jsonify({"success": True})
+
+# ---------- 全树搜索（前端搜索框用）----------
+@app.route('/api/search')
+def api_search():
+    """在服务端内存树里搜标题 / 提问 / 回答。
+
+    ★ 2026-10-30：原来前端直接在 treeData 里 includes，
+      但 /api/tree 只返回元数据（没有 userMessage/assistantMessage），
+      所以内容搜索永远命中不了。改由服务端扫。
+    """
+    q = (request.args.get('q') or '').strip()
+    if not q:
+        return jsonify({"success": True, "total": 0, "results": []})
+    scope = (request.args.get('scope') or 'all').lower()
+    fields = set((request.args.get('fields') or 'title,user,answer').split(','))
+    node_id = request.args.get('node_id') or ''
+    ql = q.lower()
+
+    tree = load_tree()
+    nodes = tree.get("nodes") or {}
+
+    if scope == 'path' and node_id:
+        ordered, cur, guard = [], node_id, 0
+        while cur and guard < 10000:
+            guard += 1
+            n = nodes.get(cur)
+            if not n:
+                break
+            ordered.append((cur, n))
+            cur = n.get("parentId")
+        ordered.reverse()
+    else:
+        ordered = list(nodes.items())
+
+    def _snip(text):
+        i = text.lower().find(ql)
+        if i < 0:
+            return text[:60]
+        lo = max(0, i - 30)
+        hi = min(len(text), i + len(q) + 30)
+        return ("…" if lo > 0 else "") + text[lo:hi] + ("…" if hi < len(text) else "")
+
+    results = []
+    for nid, n in ordered:
+        if not isinstance(n, dict):
+            continue
+        pairs = []
+        if 'title' in fields:
+            pairs.append(("标题", n.get("title") or ""))
+        if 'user' in fields:
+            pairs.append(("提问", n.get("userMessage") or ""))
+        if 'answer' in fields:
+            pairs.append(("回答", n.get("assistantMessage") or ""))
+        for label, text in pairs:
+            if text and ql in text.lower():
+                results.append({"nodeId": nid, "type": label,
+                                "title": n.get("title") or "",
+                                "snippet": _snip(text)})
+                break
+    return jsonify({"success": True, "total": len(results), "results": results[:200]})
+
 
 # ---------- 自定义客户端下载（组件勾选） ----------
 @app.route('/api/client-components')

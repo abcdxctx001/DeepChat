@@ -12,7 +12,7 @@ function Await($WinRtTask, $ResultType) {
   $netTask.Result
 }
 
-$path = "C:\Users\Administrator\Downloads\deepseek_chat_ui\client\workspace\screenshots\notepad_pw0.png"
+$path = (Join-Path $PSScriptRoot "..\screenshots\notepad.png")
 $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile])
 $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
 $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])

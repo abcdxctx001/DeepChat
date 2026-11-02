@@ -13,7 +13,7 @@ function Await($WinRtTask, $ResultType) {
 }
 
 $path = $args[0]
-if (-not $path) { $path = "C:\Users\Administrator\Downloads\deepseek_chat_ui\client\workspace\screenshots\shot_1786524200.png" }
+if (-not $path) { $path = (Join-Path $PSScriptRoot "..\screenshots\shot.png") }
 $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile])
 $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
 $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])

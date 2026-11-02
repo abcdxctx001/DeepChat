@@ -99,6 +99,33 @@ EXCLUDE_PREFIX = (
     'server/logs/thinking_dump/',
     # ★ 2026-10-21：文档合并为**单一根 README**，交付目录里不再保留 server/README.md
     'server/README.md',
+    # ★ 2026-10-30：tool/examples 里的 C++ 编译产物（examples/DeepAIde 的 .build/ 下
+    #   有 4 个 main.exe，约 7.7 MB）—— .gitignore 已挡 *.exe，交付目录也不该带。
+    'tool/examples/DeepAIde/workspace/.build/',
+    # ★ 2026-11-01：examples 里的隐私/测试内容（真实 Key、聊天库、测试脚本、
+    #   大体积测试数据）不得进交付目录 —— 仓库里已删，这里兜底防回归。
+    'tool/examples/DeepAIde/api-key.env',
+    'tool/examples/DeepAIde/workspace/.samples/',
+    'tool/examples/DeepAIde/templates/.samples/',
+    'tool/examples/chat5050/data/',
+    'tool/examples/chat5050/tests/',
+    'tool/examples/chat5050/.backups/',
+    'tool/examples/DeepAIde/workspace/statement.pdf',
+    'tool/examples/zhengshangyou/demo_play.py',
+    'tool/examples/zhengshangyou/session_state.pkl',
+    'tool/examples/stock_sim/gui_smoke_test.py',
+    'tool/examples/stock_sim/quant_gui_test.py',
+    # ★ 2026-11-01：wechat_bridge 的运行时日志/发件箱含真实聊天内容，
+    #   以及调试脚本、测试脚本、备份文件，一律不进交付目录。
+    'tool/wechat_bridge/logs/',
+    'tool/wechat_bridge/outbox/',
+    'tool/wechat_bridge/processed_cursor.txt',
+    'tool/wechat_bridge/debug_read2.py',
+    'tool/wechat_bridge/dump_batch.py',
+    'tool/wechat_bridge/activate_and_read.py',
+    'tool/headless_api/test_headless.py',
+    'tool/_start_final.py',
+    'tool/pack_all.bat.bak_before_sync',
 )
 # 运行时文件（按文件名/后缀排除）
 EXCLUDE_NAME_SUFFIX = ('.pyc', '.pyo', '.log', '.pid', '.bak', '.pricebak',
