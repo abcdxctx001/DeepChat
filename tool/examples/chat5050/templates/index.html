@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0f18">
+  <meta name="description" content="Chat5050 · 一个只有大厅的单群聊，支持文字、图片与文件。">
+  <title>{{ group_name }} · Chat5050</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body data-max-upload="{{ max_upload_mb }}" data-max-text="{{ max_text }}">
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.9 9.9 0 0 1-3.2-.6L3 21l1.7-5.1a8.1 8.1 0 0 1-.7-3.4 8.4 8.4 0 0 1 8.5-8.4A8.4 8.4 0 0 1 21 11.5Z"/>
+            <path d="M8.5 11.5h.01M12.5 11.5h.01M16.5 11.5h.01"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>{{ group_name }}</h1>
+          <p>单群 · 全员可读 · 追加式消息</p>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <div class="online-wrap">
+          <button class="online" id="onlineWrap" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="onlinePanel" title="查看在线成员">
+            <span class="conn-dot" id="connDot" aria-hidden="true"></span>
+            <span id="onlineText">连接中…</span>
+            <svg class="online-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m6 9 6 6 6-6"/>
+            </svg>
+          </button>
+
+          <div class="online-panel" id="onlinePanel" role="dialog" aria-modal="false" aria-labelledby="onlinePanelTitle" tabindex="-1" hidden>
+            <div class="online-panel-head">
+              <div class="online-panel-heading">
+                <strong id="onlinePanelTitle">在线成员</strong>
+                <span class="online-panel-count" id="onlinePanelCount">0 人</span>
+              </div>
+              <button class="online-panel-close" id="onlinePanelClose" type="button" aria-label="关闭在线成员列表">×</button>
+            </div>
+            <div class="online-panel-list" id="onlinePanelList"></div>
+            <p class="online-panel-empty" id="onlinePanelEmpty" hidden>当前无人在线</p>
+            <div class="online-panel-foot">有活动即在线 · 自动刷新</div>
+          </div>
+        </div>
+
+        <button class="ghost-btn admin-btn" id="adminBtn" type="button" title="权限管理" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3 5 6.5V12c0 4.2 2.9 7.7 7 9 4.1-1.3 7-4.8 7-9V6.5L12 3Z"/>
+            <path d="m9 12 2.2 2.2L15.4 10"/>
+          </svg>
+          <span>管理</span>
+        </button>
+        <button class="ghost-btn" id="apiBtn" type="button" title="查看 Headless API">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/>
+          </svg>
+          <span>API</span>
+        </button>
+        <button class="me-btn" id="nickBtn" type="button" title="切换昵称">
+          <span class="avatar avatar-sm" id="meAvatar">?</span>
+          <span class="me-name" id="meName">设置昵称</span>
+          <span class="me-role" id="meRole" hidden>管理员</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="chat" id="chat">
+      <div class="load-older-wrap" id="loadOlderWrap" hidden>
+        <button class="pill-btn" id="loadOlderBtn" type="button">
+          <span class="spinner" id="loadOlderSpinner" hidden></span>
+          <span id="loadOlderText">加载更早的消息</span>
+        </button>
+      </div>
+
+      <div class="messages" id="messages" role="log" aria-live="polite" aria-label="大厅消息"></div>
+
+      <div class="empty" id="empty" hidden>
+        <div class="empty-icon" aria-hidden="true">
+          <svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M56 30a21 21 0 0 1-22.5 21 24 24 0 0 1-8-1.5L9 55l5.5-15.5A20.5 20.5 0 0 1 12 30a21 21 0 0 1 22-21A21 21 0 0 1 56 30Z"/>
+            <path d="M23 30h.01M32 30h.01M41 30h.01"/>
+          </svg>
+        </div>
+        <h2>大厅还很安静</h2>
+        <p>发送第一条消息，让所有人看到。</p>
+      </div>
+
+      <button class="new-pill" id="newPill" type="button" hidden>
+        有新消息 <span aria-hidden="true">↓</span>
+      </button>
+    </main>
+
+    <footer class="composer">
+      <div class="mute-notice" id="muteNotice" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 4l16 16"/>
+          <path d="M9 9v3a3 3 0 0 0 5.1 2.1M15 9.3V6a3 3 0 0 0-5.7-1.3"/>
+          <path d="M5.5 10.5V12a6.5 6.5 0 0 0 10 5.6M12 19v3"/>
+        </svg>
+        <span id="muteNoticeText">你已被禁言</span>
+      </div>
+
+      <div class="uploads" id="uploads" aria-live="polite"></div>
+
+      <div class="composer-box">
+        <button class="icon-btn" id="attachBtn" type="button" title="发送图片或文件" aria-label="发送图片或文件">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21.4 11.6 12.3 20.7a5.4 5.4 0 0 1-7.6-7.6l9.2-9.2a3.6 3.6 0 0 1 5.1 5.1l-9.2 9.2a1.8 1.8 0 0 1-2.6-2.6l8.4-8.4"/>
+          </svg>
+        </button>
+
+        <textarea id="input" rows="1" maxlength="{{ max_text }}" placeholder="发消息到大厅…" aria-label="消息内容" enterkeyhint="send"></textarea>
+
+        <button class="send-btn" id="sendBtn" type="button" aria-label="发送消息">
+          <span>发送</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/>
+          </svg>
+        </button>
+
+        <input type="file" id="fileInput" multiple hidden>
+      </div>
+
+      <div class="composer-foot">
+        <span class="status-text" id="statusText">连接中…</span>
+        <span class="tip">Enter 发送 · Shift+Enter 换行 · 支持拖拽 / 粘贴文件</span>
+        <span class="counter" id="counter">0 / {{ max_text }}</span>
+      </div>
+
+      <div class="drop-overlay" id="dropOverlay" hidden>
+        <div class="drop-card">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 16V4M7 9l5-5 5 5"/>
+            <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>
+          </svg>
+          <span>松开即可发送到大厅</span>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- 昵称弹窗 -->
+  <div class="modal" id="nickModal" hidden>
+    <div class="modal-backdrop" data-close="nick"></div>
+    <div class="modal-card nick-card" role="dialog" aria-modal="true" aria-labelledby="nickTitle">
+      <div class="modal-logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.9 9.9 0 0 1-3.2-.6L3 21l1.7-5.1a8.1 8.1 0 0 1-.7-3.4 8.4 8.4 0 0 1 8.5-8.4A8.4 8.4 0 0 1 21 11.5Z"/>
+        </svg>
+      </div>
+      <h2 id="nickTitle">给自己取个昵称</h2>
+      <p class="modal-sub">无需注册，昵称只用来标记你的消息。</p>
+      <form id="nickForm" autocomplete="off">
+        <label class="sr-only" for="nickInput">昵称</label>
+        <input id="nickInput" type="text" maxlength="{{ max_nickname }}" placeholder="例如：小明" autocomplete="nickname" spellcheck="false" required>
+        <p class="form-error" id="nickError" role="alert" hidden></p>
+        <button class="primary-btn" id="nickSubmit" type="submit">进入大厅</button>
+      </form>
+      <p class="modal-note">昵称不做密码校验；被锁定的昵称只能由它绑定的 IP 使用。</p>
+    </div>
+  </div>
+
+  <!-- API 说明弹窗 -->
+  <div class="modal" id="apiModal" hidden>
+    <div class="modal-backdrop" data-close="api"></div>
+    <div class="modal-card api-card" role="dialog" aria-modal="true" aria-labelledby="apiTitle">
+      <button class="modal-close" type="button" data-close="api" aria-label="关闭">×</button>
+      <h2 id="apiTitle">Headless API</h2>
+      <p class="modal-sub">网页与 headless 客户端读写同一条消息流，所有接口都是普通 HTTP + JSON。</p>
+
+      <div class="api-meta">
+        <span class="api-label">Base URL</span>
+        <code id="apiBase">/</code>
+        <button class="copy-btn" id="copyBaseBtn" type="button">复制</button>
+      </div>
+
+      <div class="api-block">
+        <div class="api-block-head">
+          <span>常用请求</span>
+          <button class="copy-btn" type="button" data-copy="apiSample">复制</button>
+        </div>
+        <pre><code id="apiSample"></code></pre>
+      </div>
+
+      <ul class="api-points">
+        <li>昵称通过 <code>?nickname=</code>、JSON <code>nickname</code> 或 <code>X-Nickname</code> 请求头传入。</li>
+        <li>读取：<code>GET /api/messages</code>；发送：<code>POST /api/messages</code>；上传：<code>POST /api/upload</code>。</li>
+        <li>长轮询：<code>?after_id=&amp;since_rev=&amp;wait=25</code>，有新消息或撤回 / 权限变更立即返回。</li>
+        <li>撤回：<code>POST /api/messages/{id}/recall</code>；撤销：<code>/unrecall</code>（本人或管理员）。</li>
+        <li>权限：<code>GET /api/admin/identities</code>、<code>POST /api/admin/identities/{nickname}</code>，带 <code>X-Chat-Client: api</code> 时不受昵称锁限制。</li>
+      </ul>
+
+      <div class="api-links">
+        <a href="/api/health" target="_blank" rel="noopener">健康检查</a>
+        <a href="/api/messages?nickname=guest&amp;limit=5" target="_blank" rel="noopener">消息示例</a>
+        <span>完整文档见项目根目录 API.md</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 权限管理弹窗（仅管理员可见） -->
+  <div class="modal" id="adminModal" hidden>
+    <div class="modal-backdrop" data-close="admin"></div>
+    <div class="modal-card admin-card" role="dialog" aria-modal="true" aria-labelledby="adminTitle">
+      <button class="modal-close" type="button" data-close="admin" aria-label="关闭">×</button>
+      <h2 id="adminTitle">权限管理</h2>
+      <p class="modal-sub">昵称就是身份。可以任命管理员、禁言（定时 / 永久）、锁定昵称。</p>
+
+      <div class="admin-toolbar">
+        <label class="sr-only" for="adminSearch">搜索昵称</label>
+        <input id="adminSearch" type="search" placeholder="搜索昵称…" autocomplete="off" spellcheck="false">
+        <button class="pill-btn" id="adminRefresh" type="button">刷新</button>
+      </div>
+
+      <div class="admin-stats" id="adminStats"></div>
+      <div class="admin-list" id="adminList" aria-live="polite"></div>
+      <p class="admin-empty" id="adminEmpty" hidden>没有匹配的昵称</p>
+      <p class="admin-error" id="adminError" role="alert" hidden></p>
+
+      <p class="admin-note">
+        锁定只对网页前端生效：被锁定的昵称只有它绑定过的 IP 能登录，该 IP 也不能再换别的昵称；
+        API 调用带 <code>X-Chat-Client: api</code> 时不受锁定限制。
+      </p>
+    </div>
+  </div>
+
+  <!-- 图片预览 -->
+  <div class="lightbox" id="lightbox" hidden>
+    <button class="lightbox-close" id="lightboxClose" type="button" aria-label="关闭预览">×</button>
+    <figure class="lightbox-figure">
+      <img id="lightboxImg" alt="">
+      <figcaption class="lightbox-bar">
+        <span id="lightboxName"></span>
+        <a id="lightboxDownload" class="ghost-btn" href="#" download>下载原图</a>
+      </figcaption>
+    </figure>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>

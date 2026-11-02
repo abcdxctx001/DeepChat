@@ -1,0 +1,10 @@
+{
+  "problems": {
+    "111": {
+      "io": "file",
+      "time_limit": 2000,
+      "memory_limit": 256,
+      "spj": ""
+    }
+  }
+}

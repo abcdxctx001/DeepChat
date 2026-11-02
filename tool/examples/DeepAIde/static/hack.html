@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>对拍任务 - DeepCoder</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  body { overflow: hidden; display: flex; flex-direction: column; height: 100%; }
+  #hack-head {
+    height: 38px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 12px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  #hack-head .title { font-weight: 700; }
+  #hack-summary { color: var(--fg-dim); }
+  #hack-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  #hack-empty { padding: 12px; }
+</style>
+</head>
+<body>
+  <div id="hack-head">
+    <span class="title">对拍任务</span>
+    <span id="hack-summary"></span>
+  </div>
+  <div id="hack-list"></div>
+  <script src="hack.js"></script>
+</body>
+</html>

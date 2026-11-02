@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>编译错误 - DeepCoder</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  body { overflow: hidden; display: flex; flex-direction: column; height: 100%; }
+  #ce-head {
+    min-height: 38px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 12px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+  }
+  #ce-title { font-weight: 700; color: var(--red); font-size: 14px; }
+  #ce-meta { color: var(--fg-dim); font-size: 12px; margin-left: auto; }
+  #ce-log {
+    flex: 1;
+    margin: 0;
+    padding: 10px 12px;
+    overflow-y: auto;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  .ce-line {
+    font-family: Consolas, monospace;
+    font-size: 13px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    padding: 1px 0;
+  }
+  .ce-line.error { color: #ffb3b3; }
+  .ce-jump {
+    background: var(--bg3);
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 6px;
+    margin-right: 6px;
+    cursor: pointer;
+    font-family: Consolas, monospace;
+    font-size: 12px;
+  }
+  .ce-jump:hover { background: #3b3d4a; }
+  #ce-bar {
+    display: flex;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--bg2);
+    border-top: 1px solid var(--border);
+  }
+</style>
+</head>
+<body>
+  <div id="ce-head">
+    <span id="ce-title">编译错误</span>
+    <span id="ce-meta"></span>
+  </div>
+  <div id="ce-log"></div>
+  <div id="ce-bar">
+    <button id="ce-jump-first" class="btn">跳到第一个错误</button>
+    <button id="ce-copy" class="btn">复制全部</button>
+    <button id="ce-close" class="btn">关闭</button>
+  </div>
+  <script>
+    (function () {
+      'use strict';
+      const titleEl = document.getElementById('ce-title');
+      const metaEl = document.getElementById('ce-meta');
+      const logEl = document.getElementById('ce-log');
+      const firstErr = { line: null, col: null };
+      const RAW = { text: '' };
+
+      function jump(line, col) {
+        try {
+          localStorage.setItem('deepcoder.jump', JSON.stringify({ line: line, col: col, ts: Date.now() }));
+        } catch (e) { /* ignore */ }
+      }
+
+      function render() {
+        let data = null;
+        try {
+          data = JSON.parse(localStorage.getItem('deepcoder.ce') || 'null');
+        } catch (e) { data = null; }
+        logEl.innerHTML = '';
+        firstErr.line = null;
+        firstErr.col = null;
+        if (!data) {
+          titleEl.textContent = '没有编译错误';
+          metaEl.textContent = '';
+          const div = document.createElement('div');
+          div.className = 'ce-line';
+          div.textContent = '在主窗口触发一次编译后，错误会显示在这里。';
+          logEl.appendChild(div);
+          RAW.text = '';
+          return;
+        }
+        titleEl.textContent = data.title || '编译错误';
+        let meta = '';
+        if (data.path) meta += '文件：' + data.path;
+        if (data.ts) meta += '　时间：' + new Date(data.ts).toLocaleString();
+        metaEl.textContent = meta;
+        const log = data.log || '（无编译输出）';
+        RAW.text = log;
+        const re = /:(\d+):(\d+):/;
+        for (const rawLine of log.split('\n')) {
+          const div = document.createElement('div');
+          const m = rawLine.match(re);
+          if (m) {
+            const line = parseInt(m[1]);
+            const col = parseInt(m[2]);
+            div.className = 'ce-line error';
+            const btn = document.createElement('button');
+            btn.className = 'ce-jump';
+            btn.textContent = 'L' + line + ':' + col;
+            btn.title = '点击跳转到编辑器第 ' + line + ' 行';
+            btn.addEventListener('click', () => jump(line, col));
+            div.appendChild(btn);
+            if (firstErr.line === null) { firstErr.line = line; firstErr.col = col; }
+            div.appendChild(document.createTextNode(rawLine));
+          } else {
+            div.className = 'ce-line';
+            div.textContent = rawLine;
+          }
+          logEl.appendChild(div);
+        }
+        document.getElementById('ce-jump-first').disabled = (firstErr.line === null);
+      }
+
+      document.getElementById('ce-jump-first').addEventListener('click', () => {
+        if (firstErr.line !== null) jump(firstErr.line, firstErr.col || 1);
+      });
+      document.getElementById('ce-copy').addEventListener('click', () => {
+        navigator.clipboard.writeText(RAW.text).then(
+          () => { const b = document.getElementById('ce-copy'); b.textContent = '已复制'; setTimeout(() => { b.textContent = '复制全部'; }, 1500); },
+          () => { alert('复制失败'); }
+        );
+      });
+      document.getElementById('ce-close').addEventListener('click', () => window.close());
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') window.close();
+      });
+      window.addEventListener('storage', (e) => {
+        if (e.key === 'deepcoder.ce') render();
+      });
+      render();
+    })();
+  </script>
+</body>
+</html>

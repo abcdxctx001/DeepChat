@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepCoder</title>
+<link rel="stylesheet" href="/static/vendor/codemirror.min.css">
+<link rel="stylesheet" href="/static/vendor/theme/dracula.min.css">
+<link rel="stylesheet" href="/static/vendor/theme/material-darker.min.css">
+<link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="topbar">
+    <div class="brand">DeepCoder</div>
+    <button id="btn-toggle-sidebar" class="btn" title="显示/隐藏文件树">☰</button>
+    <span id="compile-indicator" class="hidden" title="正在编译">编译中…</span>
+    <div id="file-status">
+      <span id="cur-file">（未打开文件）</span>
+      <span id="dirty-mark" class="hidden" title="未保存">●</span>
+    </div>
+    <button id="btn-download" class="btn" title="下载当前打开的文件">&#8681; 下载</button>
+    <button id="btn-run" class="btn primary" title="编译并运行当前题目">▶ 运行</button>
+    <button id="btn-run-all" class="btn primary" title="一次编译，运行全部样例 (F11)">▶▶ 全部样例</button>
+    <button id="btn-inter" class="btn" title="交互式运行（F10）">交互</button>
+    <button id="btn-hack" class="btn" title="对拍（std + gen）">⚔ 对拍</button>
+    <button id="btn-hack-tasks" class="btn" title="查看对拍任务窗口">对拍任务<span id="hack-badge" class="hack-badge hidden"></span></button>
+    <button id="btn-template" class="btn" title="编辑默认代码模板">模板</button>
+    <button id="btn-ai-chat" class="btn" title="调出 AI 聊天分屏（与 DeepSeek 对话）">💬 AI 聊天</button>
+    <button id="btn-help" class="btn" title="快捷键帮助">?</button>
+  </div>
+
+  <div id="main">
+    <div id="sidebar">
+      <div id="sidebar-resizer" title="拖拽调整宽度"></div>
+      <div class="panel-title side-head">
+        <span>文件</span>
+        <button id="btn-refresh" class="btn mini" title="刷新文件树">↻ 刷新</button>
+      </div>
+      <div id="file-tree"></div>
+    </div>
+
+    <div id="center">
+      <div id="work-area">
+      <div id="editor-wrap">
+        <div id="pane-left">
+          <div id="editor"></div>
+          <div id="binary-viewer" class="hidden">
+            <iframe id="pdf-frame" class="hidden" title="PDF 预览"></iframe>
+            <div id="img-viewport">
+              <img id="img-view" alt="">
+            </div>
+            <div id="viewer-toolbar">
+              <button id="btn-zoom-out" class="btn mini" title="缩小">−</button>
+              <span id="zoom-label">100%</span>
+              <button id="btn-zoom-in" class="btn mini" title="放大">＋</button>
+              <button id="btn-zoom-fit" class="btn mini" title="适应窗口">适应窗口</button>
+              <button id="btn-zoom-reset" class="btn mini" title="原始大小">100%</button>
+            </div>
+          </div>
+          <div id="md-preview"></div>
+          <div id="md-divider" title="拖动调整代码区/预览区宽度"></div>
+          <div id="md-toolbar" class="hidden">
+            <button id="btn-md-preview" class="btn mini">预览</button>
+          </div>
+        </div>
+        <div id="split-divider" class="hidden" title="拖动调整左右分屏宽度"></div>
+        <div id="pane-right" class="hidden">
+          <div id="editor-right"></div>
+          <div id="binary-viewer-right" class="hidden">
+            <iframe id="pdf-frame-right" class="hidden" title="PDF 预览"></iframe>
+            <div id="img-viewport-right">
+              <img id="img-view-right" alt="">
+            </div>
+            <div id="viewer-toolbar-right" class="hidden">
+              <button id="btn-zoom-out-r" class="btn mini" title="缩小">−</button>
+              <span id="zoom-label-r">100%</span>
+              <button id="btn-zoom-in-r" class="btn mini" title="放大">＋</button>
+              <button id="btn-zoom-fit-r" class="btn mini" title="适应窗口">适应窗口</button>
+              <button id="btn-zoom-reset-r" class="btn mini" title="原始大小">100%</button>
+            </div>
+          </div>
+          <div id="md-preview-right"></div>
+          <div id="md-divider-right" title="拖动调整代码区/预览区宽度"></div>
+          <div id="md-toolbar-right" class="hidden">
+            <button id="btn-md-preview-r" class="btn mini">预览</button>
+          </div>
+        </div>
+      </div>
+      <div id="ai-chat-divider" class="hidden" title="拖动调整聊天面板宽度"></div>
+      <div id="ai-chat-panel" class="hidden">
+        <div id="ai-chat-header">
+          <span class="ai-chat-title">💬 AI 聊天</span>
+          <span id="ai-chat-status" class="ai-chat-status"></span>
+          <span class="ai-chat-spacer"></span>
+          <button id="btn-ai-key" class="btn mini" title="设置 API Key（保存到 api-key.env）">🔑 Key</button>
+          <button id="btn-ai-clear" class="btn mini" title="清空对话">清空</button>
+          <button id="btn-ai-close" class="btn mini" title="关闭聊天面板">✕</button>
+        </div>
+        <div id="ai-chat-tools">
+          <select id="ai-model" class="ai-select" title="选择模型（参考 DeepChat 操作模式）">
+            <option value="deepseek-v4-flash">⚡ Flash</option>
+            <option value="deepseek-v4-pro">🧬 Pro</option>
+          </select>
+          <select id="ai-effort" class="ai-select" title="思考深度">
+            <option value="max">思考深度: Max</option>
+            <option value="high">思考深度: High</option>
+          </select>
+          <button id="ai-thinking-toggle" class="btn mini" title="显示/隐藏思考过程">💭 思考</button>
+        </div>
+        <div id="ai-chat-messages"></div>
+        <div id="ai-chat-input-area">
+          <textarea id="ai-chat-input" rows="2" placeholder="输入消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+          <button id="btn-ai-send" class="btn primary" title="发送">➤</button>
+        </div>
+      </div>
+      </div>
+    </div>
+
+    <div id="sidepanel">
+      <div id="side-resizer" title="拖拽调整宽度"></div>
+      <div class="panel-title sec-title" data-sec="compile-config">编译设置（随当前语言切换）</div>
+      <div id="compile-config" class="sec-content">
+        <div id="cc-cpp">
+          <div class="field">
+            <label>编译器</label>
+            <input id="cfg-compiler" placeholder="g++">
+          </div>
+          <div class="field">
+            <label>编译参数（空格分隔）</label>
+            <input id="cfg-flags" placeholder="-O2 -std=c++14 -Wl,--stack=2147483647 -static">
+          </div>
+        </div>
+        <div id="cc-python" class="hidden">
+          <div class="field">
+            <label>Python 解释器</label>
+            <input id="cfg-python" placeholder="python（留空 = 当前解释器）">
+          </div>
+        </div>
+        <div id="cc-java" class="hidden">
+          <div class="field">
+            <label>javac 路径</label>
+            <input id="cfg-javac" placeholder="javac（留空 = PATH 中的 javac）">
+          </div>
+          <div class="field">
+            <label>java 路径</label>
+            <input id="cfg-java" placeholder="java（留空 = PATH 中的 java）">
+          </div>
+        </div>
+      </div>
+      <div class="panel-title sec-title" data-sec="editor-config">编辑器设置</div>
+      <div id="editor-config" class="sec-content">
+        <div class="field">
+          <label>主题</label>
+          <select id="cfg-theme">
+            <option value="material-darker">Material Darker（暗蓝）</option>
+            <option value="dracula">Dracula（暗紫）</option>
+          </select>
+        </div>
+      </div>
+      <div class="panel-title sec-title" data-sec="problem-config">题目设置</div>
+      <div id="problem-config" class="sec-content">
+        <div class="field">
+          <label>输入输出</label>
+          <select id="io-select">
+            <option value="file">文件 freopen（.in / .out）</option>
+            <option value="stdio">标准输入输出（stdin / stdout）</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>时间限制 (ms)</label>
+          <input id="cfg-time" type="number" value="2000">
+        </div>
+        <div class="field">
+          <label>内存限制 (MB)</label>
+          <input id="cfg-mem" type="number" value="256">
+        </div>
+        <div class="field" id="field-spj">
+          <label>SPJ 文件（留空自动检测）</label>
+          <input id="cfg-spj" placeholder="如 plus_checker.cpp">
+        </div>
+      </div>
+      <div class="panel-title">样例</div>
+      <div id="samples-toolbar">
+        <button id="btn-add-sample" class="btn" title="新增一组空样例">＋ 样例</button>
+        <button id="btn-import-sample" class="btn" title="从本地导入大样例文件">导入</button>
+        <button id="btn-clear-samples" class="btn" title="清空当前题目的全部样例">清空</button>
+      </div>
+      <div id="samples"></div>
+    </div>
+  </div>
+
+  <div id="modal-mask" class="hidden">
+    <div id="modal">
+      <div id="modal-title"></div>
+      <div id="modal-body"></div>
+      <div id="modal-actions"></div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/codemirror.min.js"></script>
+  <script src="/static/vendor/clike.min.js"></script>
+  <script src="/static/vendor/mode/python/python.min.js"></script>
+  <script src="/static/vendor/addon/edit/closebrackets.min.js"></script>
+  <script src="/static/vendor/mode/xml/xml.min.js"></script>
+  <script src="/static/vendor/addon/mode/overlay.min.js"></script>
+  <script src="/static/vendor/mode/markdown/markdown.min.js"></script>
+  <script src="/static/vendor/markdown-it.min.js"></script>
+  <script src="/static/vendor/katex/katex.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

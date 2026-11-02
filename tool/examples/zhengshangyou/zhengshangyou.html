@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>改版争上游 · 2人版</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+    background: radial-gradient(ellipse at 50% 30%, #1d5c3a 0%, #14502f 45%, #0c3a20 100%);
+    color: #eee;
+    overflow: hidden;
+  }
+
+  #app {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 10px 14px;
+  }
+
+  /* ---------- 顶栏 ---------- */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: linear-gradient(180deg, rgba(0,0,0,.45), rgba(0,0,0,.2));
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 12px;
+    padding: 8px 16px;
+    margin-bottom: 10px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .title { font-size: 20px; font-weight: bold; letter-spacing: 1px; }
+  .title .sub { font-size: 12px; color: #ffd76a; margin-left: 8px; font-weight: normal; }
+  .hud { display: flex; gap: 12px; font-size: 14px; }
+  .hud .item { background: rgba(0,0,0,.35); padding: 4px 12px; border-radius: 20px; border: 1px solid rgba(255,255,255,.15); }
+  .hud .item b { color: #ffd76a; }
+  #restartBtn {
+    background: linear-gradient(180deg, #e8a33d, #c97f1e);
+    color: #fff; border: none; padding: 7px 18px; border-radius: 20px;
+    font-size: 14px; cursor: pointer; font-weight: bold;
+    box-shadow: 0 2px 6px rgba(0,0,0,.35);
+  }
+  #restartBtn:hover { filter: brightness(1.1); }
+  #restartBtn:active { transform: translateY(1px); }
+
+  /* ---------- 主体布局 ---------- */
+  .main {
+    flex: 1;
+    display: flex;
+    gap: 12px;
+    min-height: 0;
+  }
+  .game-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  /* ---------- AI 面板 ---------- */
+  #aiPanel {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: rgba(0,0,0,.3);
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 12px;
+    padding: 10px 16px;
+    flex-shrink: 0;
+  }
+  .avatar {
+    width: 46px; height: 46px; border-radius: 50%;
+    background: linear-gradient(145deg, #4a7dff, #2b4fc9);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px; box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  }
+  .avatar.thinking { animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(74,125,255,.7); } 50% { box-shadow: 0 0 0 10px rgba(74,125,255,0); } }
+  .p-info { flex: 1; }
+  .p-name { font-size: 15px; font-weight: bold; }
+  .p-status { font-size: 13px; color: #9fd0ff; margin-top: 2px; min-height: 18px; }
+  .back-cards { display: flex; }
+  .card-back {
+    width: 46px; height: 66px; border-radius: 7px; margin-left: -26px;
+    background: repeating-linear-gradient(45deg, #1c4d8f 0 5px, #163f74 5px 10px);
+    border: 1px solid #0d2c55;
+    box-shadow: 0 2px 5px rgba(0,0,0,.45);
+    position: relative;
+  }
+  .card-back:first-child { margin-left: 0; }
+
+  /* ---------- 中央出牌区 ---------- */
+  #table {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(ellipse at center, rgba(255,255,255,.06), rgba(0,0,0,.25));
+    border: 1px solid rgba(255,255,255,.1);
+    border-radius: 12px;
+    min-height: 190px;
+    position: relative;
+    flex-shrink: 0;
+  }
+  #tableInner { text-align: center; padding: 10px 20px; }
+  #lastOwner { font-size: 15px; margin-bottom: 8px; }
+  #lastOwner .tag {
+    display: inline-block; padding: 2px 12px; border-radius: 12px; font-weight: bold; font-size: 13px;
+  }
+  .tag.you { background: #e8a33d; color: #fff; }
+  .tag.ai { background: #4a7dff; color: #fff; }
+  .tag.sys { background: rgba(255,255,255,.15); color: #ddd; }
+  #lastType { font-size: 13px; color: #ffd76a; margin-top: 6px; min-height: 18px; }
+  #tableMsg { font-size: 14px; color: #cde8d4; margin-top: 4px; min-height: 20px; }
+  #tableCards { display: flex; justify-content: center; flex-wrap: wrap; gap: 6px; min-height: 100px; align-items: center; }
+  .placeholder { color: rgba(255,255,255,.35); font-size: 22px; letter-spacing: 2px; }
+
+  /* ---------- 玩家面板 ---------- */
+  #playerPanel {
+    background: rgba(0,0,0,.3);
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 12px;
+    padding: 10px 16px 12px;
+    flex-shrink: 0;
+  }
+  #playerStatus { text-align: center; font-size: 15px; margin-bottom: 8px; min-height: 20px; }
+  #playerStatus .turn-you { color: #ffd76a; font-weight: bold; }
+  #playerStatus .turn-ai { color: #9fd0ff; }
+  #playerHand {
+    display: flex; justify-content: center; align-items: flex-end;
+    min-height: 134px; padding-top: 16px;
+  }
+  /* ---------- 扑克牌 ---------- */
+  .card {
+    width: 84px; height: 118px;
+    background: linear-gradient(150deg, #ffffff, #eef0f4);
+    border-radius: 9px;
+    border: 1px solid #b9bcc4;
+    box-shadow: 0 3px 7px rgba(0,0,0,.35);
+    position: relative;
+    user-select: none;
+    cursor: pointer;
+    margin: 0 4px;
+    transition: transform .18s ease, box-shadow .18s ease, border-color .18s;
+    flex-shrink: 0;
+  }
+  .card.red { color: #cf2e2e; }
+  .card.black { color: #23272e; }
+  .card .corner { position: absolute; font-size: 13px; line-height: 1.15; font-weight: bold; text-align: center; }
+  .card .corner.tl { top: 5px; left: 7px; }
+  .card .corner.br { bottom: 5px; right: 7px; transform: rotate(180deg); }
+  .card .center { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 38px; }
+  .card.joker {
+    background: linear-gradient(150deg, #3a3a52, #14141f);
+    color: #fff; border-color: #555;
+  }
+  .card.joker .center { font-size: 30px; font-weight: bold; }
+  .card.joker.red-text { background: linear-gradient(150deg, #8e2a2a, #401010); }
+  .card:hover { transform: translateY(-6px); }
+  .card.selected {
+    transform: translateY(-22px);
+    border-color: #ffd700;
+    box-shadow: 0 0 0 3px rgba(255,215,0,.75), 0 8px 18px rgba(0,0,0,.45);
+  }
+  .card.drawn { animation: drawFlash 1.6s ease; }
+  @keyframes drawFlash {
+    0% { transform: translateY(-30px) scale(1.12); box-shadow: 0 0 0 4px #4ade80, 0 10px 20px rgba(0,0,0,.5); }
+    70% { transform: translateY(-30px) scale(1.12); box-shadow: 0 0 0 4px #4ade80, 0 10px 20px rgba(0,0,0,.5); }
+    100% { transform: translateY(0) scale(1); }
+  }
+  .card.small { width: 62px; height: 88px; margin: 0 3px; cursor: default; }
+  .card.small .center { font-size: 27px; }
+  .card.small .corner { font-size: 11px; }
+  .card.small.joker .center { font-size: 22px; }
+  .card.disabled { opacity: .6; cursor: default; }
+  .card.disabled:hover { transform: none; }
+
+  /* ---------- 操作按钮 ---------- */
+  #playerActions {
+    display: flex; justify-content: center; gap: 10px; margin-top: 8px;
+  }
+  .btn {
+    border: none; border-radius: 22px; padding: 9px 26px;
+    font-size: 15px; font-weight: bold; cursor: pointer; color: #fff;
+    box-shadow: 0 2px 6px rgba(0,0,0,.35);
+    transition: filter .15s, transform .1s;
+  }
+  .btn:hover:not(:disabled) { filter: brightness(1.12); }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-play { background: linear-gradient(180deg, #35b96b, #1f8a4a); }
+  .btn-pass { background: linear-gradient(180deg, #7c8590, #5a626c); }
+  .btn-hint { background: linear-gradient(180deg, #e8a33d, #c97f1e); }
+  .btn-clear { background: linear-gradient(180deg, #5a626c, #454c55); }
+  .hidden { display: none !important; }
+  .shake { animation: shake .4s; }
+  @keyframes shake {
+    0%,100% { transform: translateX(0); }
+    25% { transform: translateX(-6px); }
+    75% { transform: translateX(6px); }
+  }
+
+  /* ---------- 日志 ---------- */
+  #logPanel {
+    width: 300px;
+    background: rgba(0,0,0,.38);
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 12px;
+    display: flex; flex-direction: column;
+    flex-shrink: 0;
+  }
+  #logTitle {
+    padding: 9px 14px; font-weight: bold; font-size: 14px;
+    border-bottom: 1px solid rgba(255,255,255,.12);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  #logTitle button {
+    background: none; border: 1px solid rgba(255,255,255,.3); color: #ddd;
+    border-radius: 10px; padding: 2px 10px; font-size: 12px; cursor: pointer;
+  }
+  #logList {
+    flex: 1; overflow-y: auto; padding: 8px 12px;
+    font-size: 13px; line-height: 1.75;
+  }
+  #logList::-webkit-scrollbar { width: 8px; }
+  #logList::-webkit-scrollbar-thumb { background: rgba(255,255,255,.2); border-radius: 4px; }
+  #logList li { list-style: none; border-bottom: 1px dashed rgba(255,255,255,.06); padding: 2px 0; }
+  #logList li.sys { color: #aaa; }
+  #logList li.round { color: #c8a2ff; font-weight: bold; }
+  #logList li.play0 { color: #ffd76a; }
+  #logList li.play1 { color: #8fc0ff; }
+  #logList li.pass { color: #9aa; font-style: italic; }
+  #logList li.draw { color: #6ee7a0; }
+  #logList li.win { color: #ff8a5c; font-weight: bold; font-size: 14px; }
+
+  /* ---------- 规则折叠 ---------- */
+  #rules {
+    margin-top: 8px; background: rgba(0,0,0,.25);
+    border: 1px solid rgba(255,255,255,.1); border-radius: 12px;
+    flex-shrink: 0;
+  }
+  #rules summary {
+    cursor: pointer; padding: 8px 16px; font-size: 13px; color: #cde8d4;
+    user-select: none;
+  }
+  #rules .content {
+    padding: 4px 18px 12px; font-size: 13px; line-height: 1.8; color: #c5d6cc;
+    max-height: 190px; overflow-y: auto;
+  }
+  #rules b { color: #ffd76a; }
+  #rules .hl { color: #6ee7a0; font-weight: bold; }
+
+  /* ---------- 结束弹窗 ---------- */
+  #modal {
+    position: fixed; inset: 0; background: rgba(0,0,0,.65);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100;
+  }
+  .modal-box {
+    background: linear-gradient(160deg, #2a2a3c, #171720);
+    border: 1px solid rgba(255,255,255,.2);
+    border-radius: 18px; padding: 34px 46px; text-align: center;
+    box-shadow: 0 20px 60px rgba(0,0,0,.6);
+    max-width: 420px;
+  }
+  .modal-box .emoji { font-size: 56px; }
+  .modal-box h2 { margin: 10px 0 6px; font-size: 26px; }
+  .modal-box.win h2 { color: #ffd76a; }
+  .modal-box.lose h2 { color: #9fb4d8; }
+  .modal-box p { color: #bbb; font-size: 14px; margin-bottom: 18px; }
+  .modal-box .btn { padding: 10px 38px; font-size: 16px; }
+
+  @media (max-width: 900px) {
+    #logPanel { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="title">🃏 改版争上游 <span class="sub">2人版 · 手牌上限5张 · 顺子2张起</span></div>
+    <div class="hud">
+      <span class="item">🂠 牌堆 <b id="deckCount">0</b></span>
+      <span class="item">第 <b id="roundNo">1</b> 轮</span>
+      <span class="item" id="turnBadge">—</span>
+    </div>
+    <button id="restartBtn">🔄 重新开始</button>
+  </header>
+
+  <div class="main">
+    <div class="game-area">
+      <!-- AI 面板 -->
+      <div id="aiPanel">
+        <div class="avatar" id="aiAvatar">🤖</div>
+        <div class="p-info">
+          <div class="p-name">AI 电脑</div>
+          <div class="p-status" id="aiStatus">准备中…</div>
+        </div>
+        <div class="back-cards" id="aiHand"></div>
+      </div>
+
+      <!-- 中央出牌区 -->
+      <div id="table">
+        <div id="tableInner">
+          <div id="lastOwner"></div>
+          <div id="tableCards"><span class="placeholder">🂠 出牌区</span></div>
+          <div id="lastType"></div>
+          <div id="tableMsg"></div>
+        </div>
+      </div>
+
+      <!-- 玩家面板 -->
+      <div id="playerPanel">
+        <div id="playerStatus">准备中…</div>
+        <div id="playerHand"></div>
+        <div id="playerActions">
+          <button id="playBtn" class="btn btn-play" disabled>出牌</button>
+          <button id="passBtn" class="btn btn-pass hidden">不要</button>
+          <button id="hintBtn" class="btn btn-hint hidden">💡 提示</button>
+          <button id="clearBtn" class="btn btn-clear hidden">清空</button>
+        </div>
+      </div>
+
+      <!-- 规则 -->
+      <details id="rules">
+        <summary>📜 规则说明（点击展开/收起）</summary>
+        <div class="content">
+          <b>基本玩法</b>：2人对战，1副54张扑克。每人手牌上限 <span class="hl">5张</span>，开局各抽5张；
+          先手随机。依次出牌，若对方不要，则从<span class="hl">第一个不要的人</span>开始依次补牌到5张
+          （牌堆无牌则停止）。<span class="hl">手牌率先出完者胜</span>。<br>
+          <b>合法牌型</b>：单张、对子、三张、三带一、三带二、顺子
+          （<span class="hl">2~5张</span>连续，3~A，不含2和王）、炸弹（四张）、王炸（大小王）。<br>
+          <b>压牌规则</b>：同牌型比大小（顺子需等长比最大牌）；炸弹可压任意非炸弹牌型；
+          王炸最大，压一切。<br>
+          <b>点数大小</b>：3 &lt; 4 &lt; … &lt; 10 &lt; J &lt; Q &lt; K &lt; A &lt; 2 &lt; 小王 &lt; 大王。<br>
+          <b>操作</b>：点击手牌选中/取消，按“出牌”打出；压牌时可选“不要”；“💡提示”帮你找一个合法出法。
+        </div>
+      </details>
+    </div>
+
+    <!-- 日志 -->
+    <div id="logPanel">
+      <div id="logTitle">📋 对局记录 <button id="clearLogBtn">清空</button></div>
+      <ul id="logList"></ul>
+    </div>
+  </div>
+</div>
+
+<!-- 结束弹窗 -->
+<div id="modal" class="hidden">
+  <div class="modal-box">
+    <div class="emoji" id="modalEmoji">🎉</div>
+    <h2 id="modalTitle">你赢了！</h2>
+    <p id="modalText"></p>
+    <button class="btn btn-play" id="againBtn">🔄 再来一局</button>
+  </div>
+</div>
+
+<script src="zhengshangyou_core.js"></script>
+<script>
+'use strict';
+/* ================= UI 状态 ================= */
+const S = {
+  deck: [], hands: [[], []],
+  turn: 0, lastPlay: null, lastPlayer: -1, firstPass: null,
+  roundNo: 1, winner: null, over: false, busy: false,
+  selected: new Set(), drawn: [], lastPlayCards: [],
+  startTime: 0, token: 0, log: []
+};
+
+/* ================= 工具 ================= */
+const $ = id => document.getElementById(id);
+const SUIT_HTML = { S: '♠', H: '♥', C: '♣', D: '♦' };
+const RED_SUITS = new Set(['H', 'D']);
+const TYPE_NAMES = {
+  SINGLE: '单张', PAIR: '对子', TRIPLE: '三张', TRIPLE_ONE: '三带一',
+  TRIPLE_PAIR: '三带二', STRAIGHT: '顺子', BOMB: '炸弹', ROCKET: '王炸'
+};
+const VALUE_NAMES = { 3: '3', 4: '4', 5: '5', 6: '6', 7: '7', 8: '8', 9: '9',
+  10: '10', 11: 'J', 12: 'Q', 13: 'K', 14: 'A', 15: '2', 16: '小王', 17: '大王' };
+
+const valueName = v => VALUE_NAMES[v] || v;
+
+function cardSort(a, b) {
+  if (a.v !== b.v) return a.v - b.v;
+  const order = { S: 0, H: 1, C: 2, D: 3 };
+  return (order[a.s] ?? 4) - (order[b.s] ?? 4);
+}
+
+function cardHTML(c, { small = false, sel = false, drawn = false, disabled = false, idx = -1 } = {}) {
+  const cls = ['card', small ? 'small' : '', disabled ? 'disabled' : '',
+    sel ? 'selected' : '', drawn ? 'drawn' : ''].filter(Boolean).join(' ');
+  const dataIdx = idx >= 0 ? ` data-idx="${idx}"` : '';
+  if (c.v >= 16) {
+    const isBig = c.v === 17;
+    return `<div class="${cls} joker ${isBig ? 'red-text' : ''}"${dataIdx}>
+      <span class="corner tl">王</span>
+      <span class="center">${isBig ? '大' : '小'}</span>
+      <span class="corner br">王</span>
+    </div>`;
+  }
+  const color = RED_SUITS.has(c.s) ? 'red' : 'black';
+  const sym = SUIT_HTML[c.s];
+  const val = VALUE_NAMES[c.v];
+  return `<div class="${cls} ${color}"${dataIdx}>
+    <span class="corner tl">${val}<br>${sym}</span>
+    <span class="center">${sym}</span>
+    <span class="corner br">${val}<br>${sym}</span>
+  </div>`;
+}
+
+function playDesc(play) {
+  if (play.type === 'STRAIGHT') return `${play.len}张顺子`;
+  return TYPE_NAMES[play.type] || play.type;
+}
+
+/* ================= 日志 ================= */
+function log(msg, cls = 'sys') {
+  const li = document.createElement('li');
+  li.className = cls;
+  li.textContent = msg;
+  const list = $('logList');
+  list.appendChild(li);
+  while (list.children.length > 300) list.removeChild(list.firstChild);
+  list.scrollTop = list.scrollHeight;
+}
+
+function logCards(prefix, cards, cls) {
+  log(prefix + '：' + cards.map(ZSY.cardName).join(' '), cls);
+}
+
+/* ================= 游戏流程 ================= */
+function newGame() {
+  const g = ZSY.createGame();
+  S.token++;
+  S.deck = g.deck; S.hands = g.hands; S.log = g.log;
+  S.turn = g.starter; S.lastPlay = null; S.lastPlayer = -1; S.firstPass = null;
+  S.roundNo = 1; S.winner = null; S.over = false; S.busy = false;
+  S.selected.clear(); S.drawn = []; S.lastPlayCards = [];
+  S.startTime = Date.now();
+  $('logList').innerHTML = '';
+  $('modal').classList.add('hidden');
+  log('🎮 新游戏开始！每人抽5张牌。', 'sys');
+  log(S.turn === 0 ? '▶ 你 先出牌' : '▶ AI 先出牌', 'round');
+  render();
+  if (S.turn === 1) scheduleAI();
+}
+
+function render() {
+  // 顶栏
+  $('deckCount').textContent = S.deck.length;
+  $('roundNo').textContent = S.roundNo;
+  $('turnBadge').textContent = S.over ? '已结束' : (S.turn === 0 ? '轮到你' : 'AI回合');
+
+  // AI 手牌背面
+  const n = S.hands[1].length;
+  const backs = [];
+  for (let i = 0; i < n; i++) backs.push(`<span class="card-back" style="z-index:${i}"></span>`);
+  $('aiHand').innerHTML = backs.join('');
+  $('aiAvatar').classList.toggle('thinking', !S.over && S.turn === 1);
+
+  // AI 状态
+  $('aiStatus').textContent = S.over
+    ? (S.winner === 1 ? '🎉 我赢啦！' : '😔 你赢了')
+    : (S.turn === 1 ? (S.lastPlay ? '思考中…' : '先出牌…') : '等待中…');
+
+  // 中央出牌区
+  if (S.lastPlay) {
+    $('lastOwner').innerHTML = `<span class="tag ${S.lastPlayer === 0 ? 'you' : 'ai'}">${
+      S.lastPlayer === 0 ? '你' : 'AI'}出了</span>`;
+    $('tableCards').innerHTML = S.lastPlayCards.map(c => cardHTML(c, { small: true })).join('');
+    $('lastType').textContent = playDesc(S.lastPlay) + '（主牌 ' + valueName(S.lastPlay.main) + '）';
+    $('tableMsg').textContent = S.over ? '' : '对方不要即可赢下本轮';
+  } else {
+    $('lastOwner').innerHTML = '<span class="tag sys">新的一轮</span>';
+    $('tableCards').innerHTML = '<span class="placeholder">🂠 等待出牌</span>';
+    $('lastType').textContent = '';
+    $('tableMsg').textContent = S.over ? '' : '自由出牌：可出任意合法牌型';
+  }
+
+  // 玩家手牌
+  const hand = S.hands[0].slice().sort(cardSort);
+  $('playerHand').innerHTML = hand.length
+    ? hand.map((c, i) => cardHTML(c, {
+        idx: i, sel: S.selected.has(c), drawn: S.drawn.includes(c),
+        disabled: S.over || S.turn !== 0
+      })).join('')
+    : '<span class="placeholder" style="font-size:18px">手牌已出完</span>';
+
+  // 玩家状态
+  const ps = $('playerStatus');
+  if (S.over) {
+    ps.innerHTML = S.winner === 0
+      ? '<span class="turn-you">🏆 你赢了！率先出完手牌</span>'
+      : '<span class="turn-ai">😢 AI 赢了，再来一局？</span>';
+  } else if (S.turn === 0) {
+    ps.innerHTML = S.lastPlay
+      ? '<span class="turn-you">▶ 轮到你：出更大的牌，或按“不要”</span>'
+      : '<span class="turn-you">▶ 轮到你：请出任意合法牌型</span>';
+  } else {
+    ps.innerHTML = '<span class="turn-ai">⏳ AI 思考中…</span>';
+  }
+
+  // 按钮
+  const myTurn = !S.over && S.turn === 0 && !S.busy;
+  $('playBtn').disabled = !myTurn || S.selected.size === 0;
+  $('passBtn').classList.toggle('hidden', !(myTurn && S.lastPlay));
+  $('hintBtn').classList.toggle('hidden', !myTurn);
+  $('clearBtn').classList.toggle('hidden', S.selected.size === 0);
+}
+
+/* ================= 玩家操作 ================= */
+$('playerHand').addEventListener('click', e => {
+  const cardEl = e.target.closest('.card');
+  if (!cardEl || S.over || S.turn !== 0 || S.busy) return;
+  const idx = +cardEl.dataset.idx;
+  const hand = S.hands[0].slice().sort(cardSort);
+  const c = hand[idx];
+  if (!c) return;
+  if (S.selected.has(c)) S.selected.delete(c); else S.selected.add(c);
+  render();
+});
+
+function selectedCards() {
+  const hand = S.hands[0].slice().sort(cardSort);
+  return hand.filter(c => S.selected.has(c));
+}
+
+$('playBtn').addEventListener('click', () => {
+  if (S.over || S.turn !== 0 || S.busy) return;
+  const cards = selectedCards();
+  if (cards.length === 0) return;
+  const play = ZSY.analyze(cards);
+  if (!play) { warnPlay('不是合法牌型（单张/对子/三张/三带一/三带二/顺子2~5张/炸弹/王炸）'); return; }
+  if (S.lastPlay && !ZSY.canBeat(play, S.lastPlay)) { warnPlay('压不过上一手牌'); return; }
+  play.cards = cards;
+  applyHumanPlay(play);
+});
+
+$('passBtn').addEventListener('click', () => doPass());
+
+function doPass() {
+  if (S.over || S.turn !== 0 || S.busy || !S.lastPlay) return;
+  S.selected.clear();
+  const ev = ZSY.applyPass(S, 0);
+  log('你 不要', 'pass');
+  afterAction(ev);
+}
+
+$('hintBtn').addEventListener('click', () => {
+  if (S.over || S.turn !== 0 || S.busy) return;
+  const plays = ZSY.gameLegalPlays(S, 0);
+  if (plays.length === 0) { log('💡 提示：你压不过，只能“不要”', 'draw'); return; }
+  const p = ZSY.randomPlay(plays);
+  S.selected = new Set(p.cards);
+  log('💡 提示：可出 ' + p.cards.map(ZSY.cardName).join(' ') + '（' + playDesc(p) + '）', 'draw');
+  render();
+});
+
+$('clearBtn').addEventListener('click', () => { S.selected.clear(); render(); });
+$('restartBtn').addEventListener('click', () => newGame());
+$('againBtn').addEventListener('click', () => newGame());
+$('clearLogBtn').addEventListener('click', () => { $('logList').innerHTML = ''; });
+
+function warnPlay(msg) {
+  log('⚠️ ' + msg, 'pass');
+  const btn = $('playBtn');
+  btn.classList.remove('shake');
+  void btn.offsetWidth;
+  btn.classList.add('shake');
+}
+
+/* ================= 出牌执行 ================= */
+function applyHumanPlay(play) {
+  S.selected.clear();
+  const ev = ZSY.applyPlay(S, 0, play);
+  S.lastPlayCards = play.cards.slice();
+  logCards('你出了', play.cards, 'play0');
+  if (ev === 'win') { finishGame(0); return; }
+  afterAction(ev);
+}
+
+function afterAction(ev) {
+  render();
+  if (ev === 'round_end') {
+    // 展示补牌结果（最后一个事件是 round_end）
+    const re = S.log[S.log.length - 1];
+    const parts = re.draws.map(d => `${d.player === 0 ? '你' : 'AI'} 补 ${d.n} 张`);
+    log('🏁 本轮结束，' + (re.winnerOfRound === 0 ? '你' : 'AI') + '赢下出牌权，' + parts.join('，'), 'round');
+    // 高亮新补的牌
+    const drawnP = [];
+    for (const d of re.draws) {
+      const h = S.hands[d.player];
+      drawnP.push(...h.slice(h.length - d.n));
+    }
+    S.drawn = drawnP;
+    render();
+    setTimeout(() => { if (!S.over) { S.drawn = []; render(); } }, 1700);
+  }
+  if (S.over) return;
+  if (S.turn === 1) scheduleAI();
+}
+
+/* ================= AI ================= */
+function scheduleAI() {
+  const myToken = S.token;
+  S.busy = true;
+  render();
+  const delay = 650 + Math.random() * 900;
+  setTimeout(() => {
+    if (myToken !== S.token || S.over) return; // 防止重开后的旧定时器
+    const plays = ZSY.gameLegalPlays(S, 1);
+    let ev;
+    if (S.lastPlay === null) {
+      const p = ZSY.randomPlay(plays);
+      ev = ZSY.applyPlay(S, 1, p);
+      S.lastPlayCards = p.cards.slice();
+      logCards('AI 出了', p.cards, 'play1');
+    } else if (plays.length === 0) {
+      ev = ZSY.applyPass(S, 1);
+      log('AI 不要', 'pass');
+    } else {
+      const p = ZSY.randomPlay(plays);
+      ev = ZSY.applyPlay(S, 1, p);
+      S.lastPlayCards = p.cards.slice();
+      logCards('AI 出了', p.cards, 'play1');
+    }
+    if (ev === 'win') { S.busy = false; finishGame(1); return; }
+    S.busy = false;
+    afterAction(ev);
+  }, delay);
+}
+
+/* ================= 结束 ================= */
+function finishGame(winner) {
+  S.over = true; S.winner = winner;
+  const secs = Math.max(1, Math.round((Date.now() - S.startTime) / 1000));
+  $('modalEmoji').textContent = winner === 0 ? '🏆' : '🤖';
+  $('modalTitle').textContent = winner === 0 ? '你赢了！' : 'AI 赢了';
+  $('modalText').textContent = (winner === 0 ? '你' : 'AI') +
+    `率先出完了手牌！用时 ${secs} 秒，共 ${S.roundNo} 轮。`;
+  $('modal').querySelector('.modal-box').className = 'modal-box ' + (winner === 0 ? 'win' : 'lose');
+  $('modal').classList.remove('hidden');
+  log(winner === 0 ? '🏆 你率先出完手牌，获胜！' : '🤖 AI 率先出完手牌，你输了。', 'win');
+  render();
+}
+
+/* ================= 启动 ================= */
+newGame();
+
+// 暴露内部接口（供自动化测试/调试使用）
+window.__ZSY_UI__ = { S, newGame, render, applyHumanPlay, doPass, ZSY };
+</script>
+</body>
+</html>
