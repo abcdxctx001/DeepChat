@@ -637,6 +637,12 @@ def _mem_filename(title):
         name += '.json'
     return name
 
+# ★ 2026-11-02：给"自动保存"提供**完整内部消息**（含 tool_calls / tool 结果 / reasoning）。
+#   前端只有显示用的 user/assistant，自动保存若用前端数据，工具过程会全部丢失。
+#   这里只存引用（不复制），每次调用工具前刷新一次。
+_OP_INTERNAL = {}      # session_id -> internal 列表
+
+
 def _mem_dump(internal, model=None, r_eff=None, think=None, usage=None, plan=None,
               pre_compress=None):
     """把当前对话内部消息序列化为记忆文件内容（去掉 system，保留完整 user/assistant/tool 历史）。
@@ -754,7 +760,9 @@ def _mem_snippet(text, keywords, width=160):
     for kw in sorted(keywords, key=len, reverse=True):
         if not kw:
             continue
-        seg = re.sub(re.escape(kw), f"【{kw}】", seg, flags=re.IGNORECASE)
+        # ★ 2026-11-02：高亮从 【】 改成 ⟦⟧ —— 正文里真实存在【文件名】，
+        #   用同一个符号会让人分不清哪个是原文、哪个是高亮（用户测试报告 ②）。
+        seg = re.sub(re.escape(kw), f"⟦{kw}⟧", seg, flags=re.IGNORECASE)
     return ("…" if start > 0 else "") + seg + ("…" if end < len(text) else ""), pos
 
 
@@ -780,6 +788,167 @@ def _mem_search_one(name, payload_or_none, raw_text, keywords, mode, search_in, 
     return hit, title_hits, content_hits, snippet
 
 
+# ★ 2026-11-02：记忆搜索的解析缓存 + 扫描上限。
+#   原先每次搜索都要把整库 JSON 重新解析一遍（~1400 文件 / ~400MB），
+#   单次可超过一分钟，期间 GIL 被占满导致整个服务端（含对话轮询）卡死。
+_MEM_PAYLOAD_CACHE = {}                 # name -> (mtime, size, payload)；dict 保持插入序
+_MEM_CACHE_MAX = 300
+MEM_SEARCH_MAX_FILES = 100000   # 有了索引后不再需要截断（原 300 会漏掉更早的记忆）              # 单次搜索最多处理多少个文件（按 mtime 取最新）
+
+
+def _mem_payload_cached(entry):
+    """带 LRU 缓存的 _mem_load_cloud：文件没变就不重复解析。"""
+    name = entry.get("name")
+    mt = entry.get("mtime", 0)
+    sz = entry.get("size", 0)
+    hit = _MEM_PAYLOAD_CACHE.get(name)
+    if hit and hit[0] == mt and hit[1] == sz:
+        # 命中：删了再插，等同 LRU 的 move_to_end
+        _MEM_PAYLOAD_CACHE.pop(name, None)
+        _MEM_PAYLOAD_CACHE[name] = hit
+        return hit[2]
+    payload = _mem_load_cloud(name)
+    _MEM_PAYLOAD_CACHE.pop(name, None)
+    _MEM_PAYLOAD_CACHE[name] = (mt, sz, payload)
+    while len(_MEM_PAYLOAD_CACHE) > _MEM_CACHE_MAX:
+        _MEM_PAYLOAD_CACHE.pop(next(iter(_MEM_PAYLOAD_CACHE)), None)
+    return payload
+
+
+# ★ 2026-11-02：记忆检索的**明文索引缓存**（零依赖，不是数据库）
+#   记忆本体仍是 workspace 下那些 JSON 文件；这里只是一份可以随时删掉重建的缓存。
+#   构建：memories.idx 每行 {"n":名,"m":mtime,"s":size,"x":全文小写}
+#   用途：搜索时先在 idx 上做字符串匹配，**只把命中的少数文件**再交回
+#        _mem_search_one 做精确判定（语义不变），从而避免整库 JSON 解析。
+MEM_IDX_NAME = "memories.idx"
+MEM_IDX_META = "memories.idx.meta"
+_mem_idx_ready = False
+
+
+def _mem_idx_paths():
+    base = os.path.dirname(os.path.abspath(MEMORY_DIR))
+    # 索引放在 workspace 下（记忆目录的同级），不污染记忆目录本身
+    return os.path.join(base, MEM_IDX_NAME), os.path.join(base, MEM_IDX_META)
+
+
+def _mem_idx_meta_load():
+    try:
+        _i, _m = _mem_idx_paths()
+        with open(_m, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+    return {}
+
+
+def _mem_idx_flatten(payload, name=""):
+    """抽成可搜索文本（复用 app 自己的抽取逻辑，保证与精确判定同源）。"""
+    try:
+        txt = _mem_extract_text(payload) or ""
+    except Exception:
+        try:
+            txt = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            txt = str(payload)
+    return (str(name) + "\n" + txt).lower()
+
+
+def _mem_idx_sync(entries, force=False):
+    """让索引与目录对齐；返回 {name: [mtime, size]}。追加式，不重写已有行。"""
+    global _mem_idx_ready
+    idx_p, meta_p = _mem_idx_paths()
+    full = force or not os.path.exists(idx_p)
+    meta = {} if full else _mem_idx_meta_load()
+
+    todo = []
+    new_meta = dict(meta)
+    for e in entries:
+        n = e.get("name")
+        mt = e.get("mtime", 0)
+        sz = e.get("size", 0)
+        old = meta.get(n)
+        if full or not old or old[0] != mt or old[1] != sz:
+            todo.append((n, mt, sz))
+        new_meta.setdefault(n, [mt, sz])
+
+    if not todo:
+        return new_meta
+
+    t0 = time.time()
+    mode = "w" if full else "a"
+    try:
+        with open(idx_p, mode, encoding="utf-8") as out:
+            for n, mt, sz in todo:
+                try:
+                    payload = _mem_load_cloud(n)
+                    if payload is None:
+                        continue
+                    body = _mem_idx_flatten(payload, n).replace("\t", " ").replace("\n", " ").replace("\r", " ")
+                    out.write(str(n) + "\t" + body + "\n")
+                except Exception:
+                    continue
+        with open(meta_p, "w", encoding="utf-8") as f:
+            json.dump(new_meta, f)
+        logging.info("[mem_idx] %s：%d 个文件，耗时 %.2fs",
+                     "全量重建" if full else "增量追加", len(todo), time.time() - t0)
+        _mem_idx_ready = True
+    except Exception as _e:
+        logging.warning("[mem_idx] 写入失败：%s", _e)
+    return new_meta
+
+
+def _mem_idx_search(kws, mode="all", search_in="both"):
+    """在明文索引上找候选文件名（bytes 级匹配，只取第一列）。"""
+    idx_p, _m = _mem_idx_paths()
+    if not os.path.exists(idx_p):
+        return None, False
+    try:
+        with open(idx_p, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None, False
+    kws_b = [str(k).lower().encode("utf-8") for k in kws if str(k).strip()]
+    if not kws_b:
+        return set(), True
+    hits = set()
+    for line in data.split(b"\n"):
+        if not line:
+            continue
+        if mode == "any":
+            ok = any(k in line for k in kws_b)
+        else:
+            ok = all(k in line for k in kws_b)
+        if ok:
+            tab = line.find(b"\t")
+            if tab > 0:
+                try:
+                    hits.add(line[:tab].decode("utf-8"))
+                except Exception:
+                    continue
+    return hits, True
+
+
+def _log_generate_error(nid, model, err, reasoning="", content="", extra=None):
+    """生成失败落盘：workspace/logs/generate_errors.log 追加一行 JSON。"""
+    try:
+        d = os.path.join(_mem_idx_paths()[0].replace(MEM_IDX_NAME, ""), "logs")
+        os.makedirs(d, exist_ok=True)
+        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "node": nid,
+               "model": model, "err_type": type(err).__name__,
+               "err": str(err)[:800],
+               "reasoning_chars": len(reasoning or ""),
+               "content_chars": len(content or ""),
+               "trace": traceback.format_exc()[-1500:]}
+        if extra:
+            rec.update(extra)
+        with open(os.path.join(d, "generate_errors.log"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def search_memories(keywords, mode="all", search_in="both", target="all",
                     limit=10, context_chars=160, wait_client=None):
     """在记忆库里按关键词搜索标题与内容。返回 (文本结果, returncode)。
@@ -787,7 +956,19 @@ def search_memories(keywords, mode="all", search_in="both", target="all",
     keywords: 关键词列表；mode: all/any；search_in: both/title/content；
     target: all/local/cloud；本地记忆经 wait_client 中转（服务器与客户端可能不同机器）。
     """
-    kws = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    # ★ 2026-11-02：每个关键词按空白拆成多个词。
+    #   原先 ["chat5050 端口"] 被当成一个短语 → 0 条（用户测试报告里最容易踩的坑）。
+    #   想搜短语时用引号包起来，这里保留原样不拆。
+    _raw_kws = [str(k) for k in (keywords or []) if str(k).strip()]
+    kws = []
+    for _k in _raw_kws:
+        _k = _k.strip()
+        if len(_k) >= 2 and _k[0] == _k[-1] and _k[0] in ('"', "'", '`'):
+            kws.append(_k[1:-1].strip())        # 引号 = 明确要短语
+        else:
+            kws.extend([w for w in _k.split() if w])
+    _seen = set()
+    kws = [k for k in kws if k and not (k in _seen or _seen.add(k))]
     if not kws:
         return "错误：keywords 不能为空", -1
     if mode not in ("all", "any"):
@@ -808,16 +989,43 @@ def search_memories(keywords, mode="all", search_in="both", target="all",
     results = []      # {source, name, mtime, size, title_hits, content_hits, snippet, searchable}
     local_unavailable = False
     local_unsearchable = 0
+    _t_search = time.time()
+    _scanned = 0
+    _skipped = 0
 
     # ---- 云端：服务器本地目录，内容可直接搜 ----
     if target in ("all", "cloud"):
-        for e in _mem_list_cloud():
-            payload = _mem_load_cloud(e["name"])
+        _entries = _mem_list_cloud()
+        # 只处理最新的 MEM_SEARCH_MAX_FILES 个文件：单次搜索的工作量必须有上界，
+        # 否则整库解析会把服务端拖死（用户要求 3 秒内返回）。
+        if len(_entries) > MEM_SEARCH_MAX_FILES:
+            _entries.sort(key=lambda x: x.get("mtime", 0), reverse=True)
+            _skipped = len(_entries) - MEM_SEARCH_MAX_FILES
+            _entries = _entries[:MEM_SEARCH_MAX_FILES]
+        # ★ 先用明文索引把候选缩到少数几个文件，再逐个精确判定。
+        _cand = None
+        try:
+            _mem_idx_sync(_entries)
+            _cand, _has_idx = _mem_idx_search(kws, mode, search_in)
+        except Exception as _e:
+            logging.warning("[mem_idx] 索引不可用，回退全量：%s", _e)
+            _cand = None
+        if _cand is not None:
+            _entries = [e for e in _entries if e.get("name") in _cand]
+        for e in _entries:
+            _scanned += 1
+            payload = _mem_payload_cached(e)
             hit, th, ch, snip = _mem_search_one(e["name"], payload, None, kws, mode, search_in, width)
             if hit:
                 results.append({"source": "cloud", "name": e["name"], "mtime": e.get("mtime", 0),
                                 "size": e.get("size", 0), "title_hits": th, "content_hits": ch,
                                 "snippet": snip, "content_hits_count": len(ch)})
+
+    try:
+        logging.info("[search_memory] kws=%s 扫描 %d 个（跳过最旧 %d 个），"
+                     "已耗时 %.2fs", kws, _scanned, _skipped, time.time() - _t_search)
+    except Exception:
+        pass
 
     # ---- 本地：经客户端中转；优先让客户端直接搜内容 ----
     if target in ("all", "local"):
@@ -876,7 +1084,8 @@ def search_memories(keywords, mode="all", search_in="both", target="all",
                     local_unsearchable = len(names)
 
     if not results:
-        msg = f"未找到匹配的记忆（关键词：{'、'.join(kws)}；范围：{search_in}；逻辑：{'全部命中' if mode=='all' else '任一命中'}）。"
+        msg = (f"未找到匹配的记忆（关键词：{'、'.join(kws)}；来源：{target}；"
+               f"字段：{search_in}；逻辑：{'全部命中' if mode=='all' else '任一命中'}）。")
         if local_unavailable:
             msg += "\n（本地记忆不可用：没有客户端中转通道）"
         if local_unsearchable:
@@ -887,7 +1096,10 @@ def search_memories(keywords, mode="all", search_in="both", target="all",
                                 x.get("mtime", 0)), reverse=True)
     total = len(results)
     results = results[:limit]
-    lines = [f"找到 {total} 条匹配记忆（关键词：{'、'.join(kws)}；{'全部命中' if mode=='all' else '任一命中'}；范围：{search_in}）：", ""]
+    # ★ 2026-11-02：原来把 search_in 当成「范围」显示，用户以为 local/cloud 过滤失效。
+    #   现在明确区分：来源=local/cloud/all，字段=both/title/content。
+    lines = [f"找到 {total} 条匹配记忆（关键词：{'、'.join(kws)}；来源：{target}；"
+             f"字段：{search_in}；逻辑：{'全部命中' if mode=='all' else '任一命中'}）：", ""]
     for i, r in enumerate(results, 1):
         ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(r["mtime"])) if r.get("mtime") else "-"
         lines.append(f"{i}. 【{r['name']}】 来源={r['source']}  修改={ts}  大小={_fmt_size(r.get('size',0))}")
@@ -996,7 +1208,10 @@ class TreeManager:
                 if sid and sid in p.get("children", []):
                     idx = p["children"].index(sid)
                     p["children"].insert(idx + 1, nid)
-                else: p["children"].append(nid)
+                else:
+                    # ★ 2026-11-02（按用户要求）：新建的对话排到**所有孩子之前**，
+                    #   而不是追加到末尾 —— 新对话应该出现在最前面。
+                    p["children"].insert(0, nid)
             else:
                 if self.tree["root"] is None: self.tree["root"] = nid
             self.dirty = True
@@ -1072,6 +1287,79 @@ def _save_inline_images(images):
             logging.warning(f"[IMG] 保存图片失败: {e}")
     return saved
 
+# ★ 2026-11-02：图片内容校验（按魔数）。
+#   起因：一个 34 字节的假 PNG（文本文件改了后缀）被发给模型，整条请求 400：
+#     "You have uploaded an unsupported image. ... webp, png, jpeg, gif"
+#   做法：发之前校验真实字节；不合法就不发（返回空串），避免整轮对话失败。
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+)
+
+
+def _sniff_image_mime(raw):
+    """按文件头判断真实图片类型；不是图片返回 None。"""
+    try:
+        if not raw or len(raw) < 12:
+            return None
+        for magic, mime in _IMAGE_MAGIC:
+            if raw.startswith(magic):
+                return mime
+        if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            return "image/webp"
+    except Exception:
+        pass
+    return None
+
+
+def _is_real_image_data_url(data_url):
+    """校验 data URL 里装的到底是不是一张**能解码**的图片。
+
+    只查文件头不够：例如 51 字节的残缺 PNG 也能通过魔数检查，
+    发出去照样被 DeepSeek 以 400 unsupported image 拒绝（用户实测复现）。
+    """
+    try:
+        u = str(data_url or "")
+        if not u.startswith("data:"):
+            return False
+        head, _, b64 = u.partition(",")
+        if "base64" not in head:
+            return False
+        import base64 as _b64
+        try:
+            raw = _b64.b64decode(b64, validate=False)
+        except Exception:
+            return False
+        if not raw or _sniff_image_mime(raw) is None:
+            return False
+        # ① 优先：真正解码一次（PIL 对"截断/损坏"最敏感）
+        try:
+            from PIL import Image as _PILImage
+            import io as _io
+            im = _PILImage.open(_io.BytesIO(raw))
+            im.verify()
+            return True
+        except Exception:
+            pass
+        # ② 回退：结构性检查（没装 PIL 时）
+        if raw.startswith(b"\x89PNG"):
+            return b"IEND" in raw[-128:]
+        if raw[:3] == b"\xff\xd8\xff":
+            return raw.rstrip(b"\x00").endswith(b"\xff\xd9")
+        if raw[:3] in (b"GIF",):
+            return raw.rstrip(b"\x00").endswith(b"\x3b")
+        if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            return len(raw) >= 64
+        if raw[:2] == b"BM":
+            return len(raw) >= 64
+        return False
+    except Exception:
+        return False
+
+
 def _image_to_data_url(sname):
     """把 uploads 目录中的图片文件转成 base64 data URL（供 LLM 图像理解）。失败返回 None。"""
     path = os.path.join(UPLOAD_FOLDER, sname)
@@ -1086,7 +1374,14 @@ def _image_to_data_url(sname):
         mime = mime_map.get(ext, "image/png")
         import base64 as _b64
         with open(path, 'rb') as f:
-            return f"data:{mime};base64,{_b64.b64encode(f.read()).decode('ascii')}"
+            raw = f.read()
+        # ★ 2026-11-02：按真实字节判断类型；不是图片就返回 None（否则整条请求 400）
+        real = _sniff_image_mime(raw)
+        if not real:
+            logging.warning("[image] %s 不是有效图片，已跳过", sname)
+            return None
+        mime = real
+        return f"data:{mime};base64,{_b64.b64encode(raw).decode('ascii')}"
     except Exception:
         return None
 
@@ -1104,8 +1399,15 @@ def _build_user_content_with_images(text, images):
             sname = img.get("file")
             if sname:
                 data_url = _image_to_data_url(sname)
-        if data_url:
+        if data_url and _is_real_image_data_url(data_url):
             blocks.append({"type": "image_url", "image_url": {"url": data_url}})
+        elif data_url:
+            # 内容不是真图片：不要发给模型（否则整条请求 400），改成一句说明
+            _nm = img.get("name") or img.get("file") or "图片"
+            blocks.append({"type": "text",
+                           "text": "（附件 `%s` 不是有效的图片文件，已跳过；"
+                                   "可提示用户重新上传 png/jpeg/webp/gif）" % _nm})
+            logging.warning("[image] 跳过非图片附件: %s", _nm)
     return blocks if len(blocks) > 1 else text
 
 def _file_ctx(files):
@@ -1866,8 +2168,20 @@ def autosave():
         fname += '.json'
     try:
         os.makedirs(MEMORY_DIR, exist_ok=True)
+        # ★ 2026-11-02：优先保存服务端的**完整内部消息**（含工具过程、思考），
+        #   前端 payload 只有显示用的 user/assistant，会丢掉全部 tool 消息。
+        _msgs = payload.get('messages') or []
+        _sid = d.get('session_id') or payload.get('session_id')
+        _use = _msgs
+        if _sid:
+            _internal = _OP_INTERNAL.get(_sid)
+            if _internal and any(isinstance(m, dict) and m.get('role') == 'tool'
+                                 for m in _internal):
+                _use = _internal
+                logging.info("[autosave] 使用内部消息 %d 条（含工具过程）sid=%s",
+                             len(_use), _sid)
         content = _mem_dump(
-            payload.get('messages') or [],
+            _use,
             payload.get('model'), payload.get('reasoning_effort'),
             payload.get('thinking_enabled'), payload.get('usage'), payload.get('plan'))
         path = os.path.join(MEMORY_DIR, fname)
@@ -2655,6 +2969,16 @@ def _append_view_image_tool(internal, tool_call, out, ret, model):
     if not data_url.startswith("data:image/"):
         internal.append({"role": "tool", "tool_call_id": tool_call.id,
                          "content": f"返回码: {ret}\n读取图片失败：客户端返回数据格式异常"})
+        return
+    # ★ 2026-11-02：内容校验（按魔数）。客户端可能把非图片文件包装成 data:image/png，
+    #   一旦发出去，DeepSeek 会整条请求 400 unsupported image（用户实测复现）。
+    #   不是真图片就只回一条说明，绝不把坏数据塞进 messages。
+    if not _is_real_image_data_url(data_url):
+        logging.warning("[image] view_image 返回的内容不是有效图片: %s", name)
+        internal.append({"role": "tool", "tool_call_id": tool_call.id,
+                         "content": (f"返回码: {ret}\n读取图片失败：`{name}` 不是有效的图片文件"
+                                     f"（内容与声明的 {mime} 不符），已跳过。"
+                                     f"请检查该文件，或改用 read_file 查看其文本内容。")})
         return
     internal.append({"role": "tool", "tool_call_id": tool_call.id,
                      "content": f"返回码: {ret}\n🖼️ 已读取图片 {name}（{_fmt_size(size)}，{mime}）。图片内容已附加在随后的 user 消息中，请查看并理解图片内容后继续任务。"})
@@ -3958,8 +4282,11 @@ def resolve_server_command(cmd_str, ctx):
         #   保留当前计划并把这件事明确告知模型（它才不会一头雾水地重建）。
         saved_plan = raw.get("plan")
         _cur_plan = _plan_get(ctx.get("session_id"))
-        _cur_active = bool(_cur_plan) and any(
-            (s or {}).get("status") != "done" for s in (_cur_plan.get("steps") or []))
+        # ★ 2026-11-07（用户反馈「加载记忆又把当前 plan 覆盖了」）：
+        #   原来只在"当前还有未完成步骤"时才保护；若当前计划刚好全部完成，
+        #   载入记忆就会把它悄悄换掉。现在：**只要当前存在计划就不覆盖**，
+        #   想改用记忆里的计划，让用户显式 #plan clear 后再 load。
+        _cur_active = bool(_cur_plan)
         if isinstance(saved_plan, dict) and isinstance(saved_plan.get("steps"), list):
             if _cur_active:
                 logging.info("[PLAN] #load 携带的旧计划已忽略（当前计划仍有未完成步骤）")
@@ -4051,6 +4378,22 @@ def resolve_server_command(cmd_str, ctx):
                     steps.append({"text": line, "status": "pending"})
             if not steps:
                 return _json_err("#plan new 需要至少一个步骤（每行一个，可用 - 开头）"), -1
+            # ★ 2026-11-07：模型常用 new 代替 add（schema 里曾没有 add），
+            #   导致"只加了一条，之前打勾的进度全清零"。这里按**步骤文本**继承旧状态。
+            try:
+                _old = _get_plan() or {}
+                _oldmap = {str(x.get("text", "")).strip(): x.get("status", "pending")
+                           for x in (_old.get("steps") or [])}
+                _kept = 0
+                for _s in steps:
+                    _k = str(_s.get("text", "")).strip()
+                    if _k in _oldmap and _oldmap[_k] != "pending":
+                        _s["status"] = _oldmap[_k]
+                        _kept += 1
+                if _kept:
+                    logging.info("[plan] new 时继承了 %d 条旧状态", _kept)
+            except Exception:
+                pass
             plan = {"title": title, "steps": steps, "updated_at": time.time()}
             _publish_plan(plan)
             summary = "\n".join(f"[ ] {i+1}. {s['text']}" for i, s in enumerate(steps))
@@ -4075,6 +4418,53 @@ def resolve_server_command(cmd_str, ctx):
             _publish_plan(plan)
             mark = {"done": "[x]", "doing": "[>]", "failed": "[!]", "pending": "[ ]"}.get(status, "[ ]")
             return f"{mark} 步骤 {idx+1} 已标记为 {status}：{plan['steps'][idx]['text']}", 0
+        # ★ 2026-11-07（按用户要求）：像待办清单一样"随时加一条 / 删一条"，
+        #   不必每次用 #plan new 全量替换（替换容易把早先记下的问题冲掉）。
+        if action == "add":
+            rest = first[len("#plan add"):].strip()
+            if not rest:
+                return _json_err("#plan add 语法：#plan add <文本>  或  #plan add <序号> <文本>"), -1
+            at = None
+            m2 = re.match(r'^(\d+)\s+(.*)$', rest)
+            if m2:
+                at = int(m2.group(1)) - 1
+                rest = m2.group(2).strip()
+            if not rest:
+                return _json_err("#plan add 需要步骤文本"), -1
+            plan = _get_plan()
+            if not plan:
+                plan = {"title": "任务计划", "steps": [], "updated_at": time.time()}
+            steps = plan.get("steps") or []
+            item = {"text": rest, "status": "pending"}
+            if at is None:
+                steps.append(item)
+                pos = len(steps)
+            else:
+                if at < 0 or at > len(steps):
+                    at = len(steps)
+                steps.insert(at, item)
+                pos = at + 1
+            plan["steps"] = steps
+            plan["updated_at"] = time.time()
+            _publish_plan(plan)
+            return f"➕ 已加入第 {pos} 条：{rest}（共 {len(steps)} 条）", 0
+        if action in ("del", "remove", "rm"):
+            if len(parts) < 3:
+                return _json_err("#plan del 语法：#plan del <序号>"), -1
+            try:
+                idx = int(parts[2]) - 1
+            except Exception:
+                return _json_err(f"步骤序号无效：{parts[2]}"), -1
+            plan = _get_plan()
+            if not plan or not plan.get("steps"):
+                return _json_err("尚无任务计划"), -1
+            steps = plan["steps"]
+            if idx < 0 or idx >= len(steps):
+                return _json_err(f"步骤序号超出范围（1-{len(steps)}）"), -1
+            gone = steps.pop(idx)
+            plan["updated_at"] = time.time()
+            _publish_plan(plan if steps else None)
+            return f"🗑️ 已删除第 {idx+1} 条：{gone.get('text','')}（剩 {len(steps)} 条）", 0
         if action == "done":
             plan = _get_plan()
             if not plan:
@@ -5562,14 +5952,15 @@ COMMON_TOOLS = [
         "type": "function",
         "function": {
             "name": "plan",
-            "description": "记录本回合的任务计划并在左侧任务视图显示，逐项打勾跟踪进度：\n- #plan new <标题>\\n- 步骤1\\n- 步骤2 ... 创建/替换任务计划（每行一个步骤，可用 - 开头）；\n- #plan step <序号> done|doing|failed 更新某步骤状态；\n- #plan done 全部完成；#plan clear 清空；#plan 查看当前计划。\n任务开始时应先 #plan new 创建计划，执行中逐项 #plan step 更新，全部完成后 #plan done。",
+            "description": "记录本回合的任务计划并在左侧任务视图显示，逐项打勾跟踪进度：\n- #plan new <标题>\\n- 步骤1\\n- 步骤2 ... 创建/替换任务计划（每行一个步骤，可用 - 开头）；\n- #plan step <序号> done|doing|failed 更新某步骤状态；\n- #plan done 全部完成；#plan clear 清空；#plan 查看当前计划。\n用户在长任务里会陆续报多个 bug：每发现一个就用 #plan add 记一条待办，修好一个就 #plan step 打勾，必要时 #plan del 删掉（不要用 #plan new 全量替换，那会把还没修的问题冲掉）。任务开始时应先 #plan new 创建计划，执行中逐项 #plan step 更新，全部完成后 #plan done。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["new", "step", "done", "clear", "view"], "description": "操作：new=创建计划，step=更新步骤状态，done=全部完成，clear=清空，view=查看"},
+                    "action": {"type": "string", "enum": ["new", "add", "del", "step", "done", "clear", "view"], "description": "操作：new=创建/替换整表（慎用，会重置未匹配的进度），add=追加一条待办，del=删除一条，step=更新某步状态，done=全部完成，clear=清空，view=查看"},
                     "title": {"type": "string", "description": "计划标题（action=new 时必填）"},
                     "steps": {"type": "array", "items": {"type": "string"}, "description": "步骤列表（action=new 时必填，每项一个步骤）"},
-                    "index": {"type": "integer", "description": "步骤序号（1 起，action=step 时必填）"},
+                    "text": {"type": "string", "description": "待办文本（action=add 时必填）"},
+                    "index": {"type": "integer", "description": "序号（1 起）：action=step/del 必填；action=add 时可选，表示插到该序号之前"},
                     "status": {"type": "string", "enum": ["done", "doing", "failed", "pending"], "description": "步骤新状态（action=step 时使用）"}
                 },
                 "required": ["action"]
@@ -6187,6 +6578,26 @@ def tool_to_command(tool_call):
             if idx is None:
                 return None
             return f"#plan step {int(idx)} {status}"
+        elif action == "add":
+            # ★ 2026-11-07：单条追加（文本从 step/text 取，可带 index 插到某条之前）
+            _txt = (args.get("text") or args.get("step") or args.get("title") or "").strip()
+            if not _txt:
+                return None
+            _at = args.get("index")
+            if _at:
+                try:
+                    return f"#plan add {int(_at)} {_txt}"
+                except Exception:
+                    pass
+            return "#plan add " + _txt
+        elif action in ("del", "delete", "remove"):
+            _at = args.get("index")
+            if _at is None:
+                return None
+            try:
+                return f"#plan del {int(_at)}"
+            except Exception:
+                return None
         elif action == "done":
             return "#plan done"
         elif action == "clear":
@@ -7368,6 +7779,7 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
                                 _record_active_task(_tsess, task_id, cmd_str)
                         # agent 管理命令：服务端直接处理（不经浏览器/客户端中转）
                         _tool_t0 = time.time()   # ★ 工具耗时统计起点（会话属性面板）
+                        _OP_INTERNAL[session_id] = internal      # ★ 供自动保存取用
                         server_out = resolve_server_command(cmd_str, {
                             "session_id": session_id, "is_parent": True, "agent": None,
                             "internal": internal, "usage": usage,
@@ -7879,6 +8291,9 @@ def child_agent_stream(a):
                             if _ta:
                                 _record_active_task(_ta, task_id, cmd_str)
                         # 服务端命令（#return 等）
+                        # ★ 2026-11-07：子 agent 作用域里变量是 sid，不是 session_id
+                        #   （上一版写错导致 NameError: session_id is not defined → 子 agent 直接失败）
+                        _OP_INTERNAL[sid] = internal
                         server_out = resolve_server_command(cmd_str, {
                             "session_id": sid, "is_parent": False, "agent": a,
                             "internal": internal, "usage": usage,
@@ -8105,6 +8520,15 @@ def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input):
         update_node_in_tree(nid, title=title)
     except Exception as e:
         logging.error(f"节点 {nid} 生成失败: {e}")
+        # ★ 2026-11-02：失败明细落盘到 workspace/logs/generate_errors.log。
+        #   原先只有一句 logging.error，日志里查不到断在哪、已经收了多少字。
+        try:
+            _log_generate_error(nid, model, e,
+                                reasoning=(full_reasoning or ""),
+                                content=(full_content or ""),
+                                extra={"stop_reason_before": _stop_reason})
+        except Exception:
+            pass
         _stop_reason = 'error'
         update_node_in_tree(nid, assistantMessage=f"[生成失败: {str(e)}]")
     finally:
@@ -8112,6 +8536,16 @@ def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input):
         #   现象：用户只看到思考断了半句、下面全空，无法判断是被停止还是出了故障。
         if _stop_reason is None:
             _stop_reason = 'empty_reply' if not full_content else 'stream_end'
+        # ★ 2026-11-02：上游没返回内容（API 异常/断流）也落盘，方便事后查
+        if _stop_reason == 'empty_reply':
+            try:
+                _log_generate_error(nid, model,
+                                    RuntimeError('上游未返回任何内容（empty_reply）'),
+                                    reasoning=(full_reasoning or ""),
+                                    content=(full_content or ""),
+                                    extra={"stop_reason": _stop_reason})
+            except Exception:
+                pass
         try:
             update_node_in_tree(nid, generating=False,
                                 stopReason=_stop_reason,

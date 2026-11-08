@@ -210,3 +210,77 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## 5. CodeMirror
+
+| 项 | 内容 |
+|---|---|
+| 位置 | `tool/examples/DeepAIde/static/vendor/codemirror.min.js`、`codemirror.min.css`、`clike.min.js` |
+| 上游 | https://github.com/codemirror/codemirror |
+| 版本 | 压缩产物未内嵌版本号（文件头无 `/*! ... vX.Y.Z */`），随 example 构建一起提供 |
+| 许可 | MIT |
+| 版权 | Copyright (C) 2017 Marijn Haverbeke and others |
+
+> **更正**：`clike.min.js` 曾被误认为是 highlight.js 的 clike 语法包。
+> 实际它的 UMD 头部写着 `require("../../lib/codemirror")` / `define(["../../lib/codemirror"] ...)`，
+> 即 **CodeMirror 的 C-like 语言模式**，因此适用 CodeMirror 的 MIT 许可，
+> 不存在 BSD-3-Clause 的硬性义务（highlight.js 本身的 BSD-3 义务已由第 2 节覆盖）。
+
+```
+MIT License
+
+Copyright (C) 2017 Marijn Haverbeke <marijn@haverbeke.berlin> and others
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## 6. markdown-it
+
+| 项 | 内容 |
+|---|---|
+| 位置 | `tool/examples/DeepAIde/static/vendor/markdown-it.min.js` |
+| 上游 | https://github.com/markdown-it/markdown-it |
+| 版本 | 13.0.2（文件头 `/*! markdown-it 13.0.2 ... @license MIT */`） |
+| 许可 | MIT |
+| 版权 | Copyright (c) 2014-2022 Vitaly Puzrin and Alex Kocharin |
+
+```
+MIT License
+
+Copyright (c) 2014-2022 Vitaly Puzrin <vitaly@rcdesign.ru>
+                       Alex Kocharin <alex@kocharin.ru>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

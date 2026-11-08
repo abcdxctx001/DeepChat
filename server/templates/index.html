@@ -75,6 +75,17 @@
         .agent-refresh-btn{background:none;border:none;font-size:1rem;cursor:pointer;margin-left:0.5rem;color:inherit;vertical-align:middle}
         .clear-op-btn{background:#ef4444;color:white;border:none;border-radius:8px;padding:0.5rem 1rem;cursor:pointer;font-size:0.85rem;display:none}
         .clear-op-btn:hover{background:#dc2626}
+        /* ★ 2026-11-08（按用户要求）：暗色模式下，操作面板里那几颗大红大蓝的按钮太刺眼。
+           这些按钮的颜色是**内联 style** 写死的（#ef4444 / #3b82f6），
+           类选择器盖不住，所以用属性选择器 + !important 统一压暗。 */
+        body.dark .clear-op-btn{background:#7f1d1d;color:#fecaca}
+        body.dark .clear-op-btn:hover{background:#991b1b}
+        body.dark button[style*="#ef4444"]{background:#7f1d1d !important;color:#fecaca !important;border-color:#991b1b !important}
+        body.dark button[style*="#dc2626"]{background:#7f1d1d !important;color:#fecaca !important}
+        body.dark button[style*="#3b82f6"]{background:#1e3a8a !important;color:#dbeafe !important;border-color:#1e40af !important}
+        body.dark button[style*="#2563eb"]{background:#1e3a8a !important;color:#dbeafe !important}
+        /* 滑块与"思考深度"那行也别太亮 */
+        body.dark input[type="range"]{accent-color:#3b82f6}
         .main-area{flex:1;display:flex;flex-direction:column;overflow:hidden}
         .messages-container{flex:1;overflow-y:auto;padding:1.5rem 2rem;display:flex;flex-direction:column;gap:1rem}
         .message{display:flex;flex-direction:column;max-width:85%;animation:fadeIn .2s}
@@ -91,6 +102,22 @@
            现在改用不碰布局的办法：卸载远处框里最贵的装饰（语法高亮 span、复制按钮），
            见 stripFarDecorations()。高度天然不变，不依赖任何浏览器特性。 */
         .user-msg{align-self:flex-end}
+        /* ★ 2026-11-08（按用户要求）：用户消息过长时只显示前 8 行，可展开 */
+        .user-msg .bubble.collapsed{max-height:calc(8 * 1.62em);overflow:hidden;position:relative}
+        .user-msg .bubble.collapsed::after{content:'';position:absolute;left:0;right:0;bottom:0;height:1.6em;background:linear-gradient(to bottom,rgba(255,255,255,0),rgba(59,130,246,.92))}
+        /* ★ 折叠按钮：全局 `button{background:#3b82f6}` 会把它染成一坨蓝色药丸，
+           这里必须用更高优先级 + !important 覆盖掉全部按钮外观。 */
+        .user-msg .msg-expand-btn,
+        .msg-expand-btn{
+            background:transparent !important;background-image:none !important;
+            border:none !important;box-shadow:none !important;
+            color:#2563eb !important;font-size:0.78rem !important;font-weight:400 !important;
+            padding:2px 0 !important;margin-top:4px;cursor:pointer;
+            align-self:flex-end;width:auto !important;min-width:0 !important;
+            border-radius:0 !important;line-height:1.4 !important;height:auto !important;
+        }
+        .user-msg .msg-expand-btn:hover,
+        .msg-expand-btn:hover{background:transparent !important;color:#1d4ed8 !important;text-decoration:underline}
         .assistant-msg{align-self:flex-start;width:100%;max-width:90%;position:relative}
 /* ★ 2026-10-09（修改四）：白框折叠。
    ⚠️ 这里**不要**加 content-visibility —— 上面 59-70 行的结论已经证明它走不通
@@ -1693,6 +1720,7 @@ function appendChildUserMsg(s, text) {
     div.className = 'message user-msg';
     div.innerHTML = `<div class="bubble">${buildUserBubbleInner(text, null)}</div>`;
     s.body.appendChild(div);
+    try{ applyUserMsgCollapse(div); }catch(e){}   // ★ 长消息折叠（导入/回放）
     smartScrollToBottom();
 }
 
@@ -2491,11 +2519,79 @@ function iconizeTitle(html){
     });
 }
 
+// ★ 2026-11-02：块引用里的行间公式。
+//   问题：protectFormulas 在 markdown 解析前用正则找 `\[ … \]` / `$$ … $$`，
+//   而 `> \[` 这类行前面带引用前缀 `> `，导致
+//     · 首尾两行的 `> ` 不在匹配范围内 → 渲染出两个多余的 `>`
+//     · `> $$` 更是完全匹配不到行首 → 公式没被识别
+//   做法：把这些"整行都是公式定界符"的块整体剥掉 `>` 前缀（块内每行也剥），
+//   让公式回到行首被正常识别。引用块会在公式前后各自结束/继续。
+function _blockPrefix(line){
+    // 返回该行的"块级前缀"（引用/列表/标题），没有则返回 ''
+    const m = String(line).match(/^([ \t]*(?:>[ \t]?)+)/);
+    if (m) return m[1];
+    const m2 = String(line).match(/^[ \t]*(?:[-*+][ \t]+|\d+\.[ \t]+|#{1,6}[ \t]+)/);
+    return m2 ? m2[0] : '';
+}
+// ★ 2026-11-02：块级前缀里的行间公式（引用 `>`、列表 `- `/`1. `、标题 `## `）
+//   现象：`> \[ … \]` 多出两个 `>`；`- \[ … \]` / `## $$` 干脆识别不出公式。
+//   原因：公式保护发生在 markdown 解析之前，只认**行首**的 `\[` / `$$`。
+//   做法：这里接手"带块级前缀的行间公式"——
+//     剥掉每行的前缀收集公式 → 自己登记到 latexBlocks →
+//     以 `前缀 + LATEXBLOCK<i>END` 放回，从而仍留在原来的容器内。
+function _unwrapPrefixedMath(text, latexBlocks){
+    const src = String(text == null ? '' : text);
+    if(src.indexOf('\\[') < 0 && src.indexOf('$$') < 0) return src;
+    const lines = src.split('\n');
+    const out = [];
+    let inBlock = false, closeRe = null, buf = [], prefix = '';
+    for(const line of lines){
+        const pre = _blockPrefix(line);
+        const stripped = pre ? line.slice(pre.length) : line;
+        if(!inBlock){
+            const isOpenBracket = /^\s*\\\[\s*$/.test(stripped);
+            const isOpenDollar  = /^\s*\$\$\s*$/.test(stripped);
+            if(pre && (isOpenBracket || isOpenDollar)){
+                inBlock = true;
+                prefix = pre;
+                closeRe = isOpenBracket ? /^\s*\\\]\s*$/ : /^\s*\$\$\s*$/;
+                buf = [];
+                continue;
+            }
+            out.push(line);
+            continue;
+        }
+        if(closeRe.test(stripped)){
+            const formula = buf.join('\n').trim();
+            inBlock = false; closeRe = null; buf = [];
+            if(formula && latexBlocks){
+                latexBlocks.push({type:'block', formula:formula});
+                out.push(prefix + 'LATEXBLOCK' + (latexBlocks.length - 1) + 'END');
+            }else{
+                out.push(prefix.trim());
+            }
+            continue;
+        }
+        buf.push(stripped);
+    }
+    if(inBlock && buf.length){                 // 未闭合：原样吐回，别吞内容
+        out.push(prefix + buf.join('\n' + prefix));
+    }
+    return out.join('\n');
+}
+
 function renderMarkdown(text){if(!text)return'';if(typeof marked==='undefined')return fallbackMarkdown(text);const codeFragments=[];let codeIdx=0;// ★ 2026-10-23（修「4 反引号围栏被切错 → 代码块里显示 &lt;」）：
     //   原来只认 3 个反引号，遇到 ````markdown 包 ```cpp 的合法写法会匹配错位，
     //   把中间代码当普通文本转义，最后二次转义显示成 &lt;。
     //   改用反向引用：围栏 3 个及以上、开闭数量必须一致。
-    const safeText=text.replace(/(`{3,})[\s\S]*?\1|`[^`\n]+`/g,m=>{codeFragments.push(m);return`\x00CODE${codeIdx++}\x00`});const latexBlocks=[];function protectFormulas(seg){seg=seg.replace(/\\\[([\s\S]*?)\\\]/g,(_,f)=>{latexBlocks.push({type:'block',formula:f.trim()});return`\nLATEXBLOCK${latexBlocks.length-1}END\n`});seg=seg.replace(/(?:^|\n)\s*\$\$\s*([\s\S]*?)\s*\$\$\s*(?=\n|$)/g,(_,f)=>{latexBlocks.push({type:'block',formula:f.trim()});return`\nLATEXBLOCK${latexBlocks.length-1}END\n`});seg=seg.replace(/\\\(([\s\S]*?)\\\)/g,(_,f)=>{latexBlocks.push({type:'inline',formula:f.trim()});return`LATEXINLINE${latexBlocks.length-1}END`});seg=seg.replace(/\$([^$\n]+?)\$/g,(_,f)=>{latexBlocks.push({type:'inline',formula:f.trim()});return`LATEXINLINE${latexBlocks.length-1}END`});return seg}// ★ 2026-10-14（治本修「回复里的 HTML 标签被吃掉」）：
+    const safeText=text.replace(/(`{3,})[\s\S]*?\1|`[^`\n]+`/g,m=>{codeFragments.push(m);return`\x00CODE${codeIdx++}\x00`})
+    // ★ 2026-11-02：把**缩进代码块**（4 空格 / Tab）也抽成占位符。
+    //   原来只保护了 ``` 围栏与行内代码，缩进块里的 \[…\] / $$…$$ / $…$ / \(…\)
+    //   会被 protectFormulas 当成公式渲染，本应原样显示的代码就变形了。
+    .replace(/(?:^|\n)((?:(?: {4}|\t)[^\n]*(?:\n|$))+)/g,(m,block)=>{
+        codeFragments.push(block);
+        return '\n\x00CODE'+(codeIdx++)+'\x00';
+    });const latexBlocks=[];function protectFormulas(seg){seg=_unwrapPrefixedMath(seg,latexBlocks);seg=seg.replace(/(^|\n)(?![ \t]{4}|\t)\\\[([\s\S]*?)\\\]/g,(m0,lead,f)=>{latexBlocks.push({type:'block',formula:f.trim()});return lead+`\nLATEXBLOCK${latexBlocks.length-1}END\n`});seg=seg.replace(/(?:^|\n)\s*\$\$\s*([\s\S]*?)\s*\$\$\s*(?=\n|$)/g,(_,f)=>{latexBlocks.push({type:'block',formula:f.trim()});return`\nLATEXBLOCK${latexBlocks.length-1}END\n`});seg=seg.replace(/\\\(([\s\S]*?)\\\)/g,(_,f)=>{latexBlocks.push({type:'inline',formula:f.trim()});return`LATEXINLINE${latexBlocks.length-1}END`});seg=seg.replace(/\$([^$\n]+?)\$/g,(_,f)=>{latexBlocks.push({type:'inline',formula:f.trim()});return`LATEXINLINE${latexBlocks.length-1}END`});return seg}// ★ 2026-10-14（治本修「回复里的 HTML 标签被吃掉」）：
 //   marked 默认**不转义原始 HTML** —— 源文本里的 <title>/<b>/<div> 会被当真实标签解析，
 //   <title> 更是文档级元素会被移出内容流，导致后面的文字整段消失（用户实测 Output: <title>）。
 //   这里把源文本里的尖括号转义成实体：原始标签显示为字面量，而 markdown 语法照常渲染。
@@ -2545,7 +2641,13 @@ function attachCodeToolbar(pre, code){
     tb._codeText = code.textContent || '';
     const copyBtn = document.createElement('button');
     copyBtn.textContent = '复制';
-    copyBtn.addEventListener('click', copyToClipboard(code.textContent || ''));
+    // ★ 2026-11-07（修「复制只复制到一小段」）：
+    //   copyToClipboard(text) 返回的是闭包，text 在**挂按钮那一刻**就被固定。
+    //   而按钮是在"安静 260ms"后挂上的，此时流式生成往往还没结束 ——
+    //   后面继续输出的内容永远不会被复制。改为**点击时**再取当前内容。
+    copyBtn.addEventListener('click', function(ev){
+        return copyToClipboard(code.textContent || '').call(this, ev);
+    });
     const downBtn = document.createElement('button');
     downBtn.textContent = '下载';
     downBtn.addEventListener('click', () => {
@@ -2669,7 +2771,8 @@ function enhanceCodeBlocks(c, opts){
 //   这里在创建按钮时把原文存进 WeakMap（跟着元素生命周期，不担心泄漏），
 //   restore 时据此原样重建。
 const _mdRawOfBubble = new WeakMap();
-function enhanceBubble(b,raw){enhanceCodeBlocks(b,{save:true});renderLatex(b);enhanceLinks(b);scheduleProcFold();if(raw&&!b.querySelector('.copy-md-btn')){const btn=document.createElement('button');btn.className='copy-md-btn';btn.textContent='📋 复制 Markdown';btn.addEventListener('click',copyToClipboard(raw));b.appendChild(btn);try{_mdRawOfBubble.set(b,String(raw));}catch(e){}}}
+function enhanceBubble(b,raw){enhanceCodeBlocks(b,{save:true});renderLatex(b);enhanceLinks(b);scheduleProcFold();if(raw&&!b.querySelector('.copy-md-btn')){const btn=document.createElement('button');btn.className='copy-md-btn';btn.textContent='📋 复制 Markdown';// ★ 2026-11-07：点击时再取最新 raw（流式期间挂的按钮原先把早期内容固化了）
+btn.addEventListener('click',function(ev){const _cur=(_mdRawOfBubble.get(b)||raw||'');return copyToClipboard(_cur).call(this,ev);});b.appendChild(btn);try{_mdRawOfBubble.set(b,String(raw));}catch(e){}}}
 // ★ 2026-09-21：把「最终答案」类内容写进容器（含代码块保活 + 定型后补按钮）。
 //   所有 final_answer / 收尾路径都应调这个，而不是裸写 innerHTML，
 //   否则重建出来的 <pre> 拿不到「复制/下载」，或按钮被下一次重建抹掉。
@@ -3042,6 +3145,13 @@ function updateReasoningDom(el,getFullText,force,noCode){
 const _hlFinalizeTimers=new WeakMap();
 function scheduleHlFinalize(el){
     if(!el)return;
+    // ★ 2026-11-02：生成期间不排高亮。
+    //   chat 每 3 秒轮询会重建气泡 → 高亮被丢弃 → 260ms 后补回 → 再被丢弃，
+    //   表现就是代码块〳反复横跳〴。等生成结束再一次性补上。
+    try{
+        const nodes = (typeof treeData!=='undefined' && treeData && treeData.nodes) ? treeData.nodes : {};
+        for(const k in nodes){ if(nodes[k] && nodes[k].generating) return; }
+    }catch(e){}
     try{
         const old=_hlFinalizeTimers.get(el);
         if(old)clearTimeout(old);
@@ -3226,7 +3336,10 @@ function _draftKey(){
     return currentMode === 'operation' ? '__op__' : (selectedNodeId || '__chat_none__');
 }
 function _stashInput(){
-    if(_inputDraftKey === null) return;          // 尚未绑定过，不用存
+    // ★ 2026-11-08：每次都按**当前**模式/节点算键。
+    //   原来用的是上次 _restoreInput 绑定的旧键，切模式后输入会一直存到旧键下。
+    _inputDraftKey = _draftKey();
+    if(_inputDraftKey === null) return;
     _inputDrafts.set(_inputDraftKey, {
         text: userInput.value,
         files: pendingFiles.slice(),
@@ -3905,12 +4018,30 @@ async function smRefresh(){
 function smStart(){ if(!smTimer){ smTimer = setInterval(smRefresh, 2000); } smRefresh(); }
 function smStop(){ if(smTimer){ clearInterval(smTimer); smTimer = null; } }
 function smOpenPanel(){
+    // ★ 2026-11-08：**先量按钮位置，再隐藏按钮**。
+    //   上一版先 display:none 再 getBoundingClientRect() → 量到全 0 → 面板跑到左上角。
+    let _btnRect = null;
+    try{ _btnRect = smOpenBtn.getBoundingClientRect(); }catch(e){}
     smOpen = true; smPanel.classList.add('open'); smOpenBtn.style.display = 'none';
-    // 恢复上次拖动位置（若有）
+    // 恢复上次拖动位置（若有）；没有则**贴着按钮当前位置**打开
     if(!smPanel.classList.contains('fullscreen')){
+        let placed = false;
         try{ const p = JSON.parse(localStorage.getItem('smPanelPos') || 'null');
-            if(p && p.left){ smPanel.style.left = p.left; smPanel.style.top = p.top; smPanel.style.right = 'auto'; }
+            if(p && p.left){ smPanel.style.left = p.left; smPanel.style.top = p.top; smPanel.style.right = 'auto'; placed = true; }
         }catch(e){}
+        if(!placed && _btnRect){
+            try{
+                const pw = smPanel.offsetWidth || 420, ph = smPanel.offsetHeight || 320;
+                // 面板右缘对齐按钮右缘，向下偏 8px；越界则夹到视口内
+                let L = _btnRect.right - pw;
+                let T = _btnRect.bottom + 8;
+                L = Math.max(8, Math.min(L, window.innerWidth - pw - 8));
+                T = Math.max(8, Math.min(T, window.innerHeight - ph - 8));
+                smPanel.style.left = L + 'px';
+                smPanel.style.top = T + 'px';
+                smPanel.style.right = 'auto';
+            }catch(e){}
+        }
     }
     // 打开后保持窗口模式（可点「⛶ 全屏」放大）
     smSetFullscreen(false);
@@ -3968,7 +4099,56 @@ if(smHead){
         smDrag = null;
     });
 }
-// 清除 screenshots 截图缓存（调用 agent /vui/clear_screenshots）
+// ★ 2026-11-08（按用户要求）：「🖥 屏幕监控」按钮可拖动，且新打开的面板出现在按钮附近。
+(function initSmButtonDrag(){
+    const btn = smOpenBtn;
+    if(!btn) return;
+    const KEY = 'smOpenBtnPos';
+    // 恢复上次位置
+    try{
+        const p = JSON.parse(localStorage.getItem(KEY) || 'null');
+        if(p && p.left){
+            btn.style.left = p.left; btn.style.top = p.top;
+            btn.style.right = 'auto';
+        }
+    }catch(e){}
+    let drag = null;
+    let moved = false;   // ★ 供 click 拦截使用
+    btn.addEventListener('mousedown', (e)=>{
+        if(e.button !== 0) return;
+        const r = btn.getBoundingClientRect();
+        drag = {dx: e.clientX - r.left, dy: e.clientY - r.top};
+        moved = false;
+        e.preventDefault();
+    });
+    document.addEventListener('mousemove', (e)=>{
+        if(!drag) return;
+        let nx = e.clientX - drag.dx, ny = e.clientY - drag.dy;
+        nx = Math.max(0, Math.min(nx, window.innerWidth - 60));
+        ny = Math.max(0, Math.min(ny, window.innerHeight - 40));
+        btn.style.left = nx + 'px'; btn.style.top = ny + 'px';
+        btn.style.right = 'auto';
+        moved = true;
+    });
+    document.addEventListener('mouseup', ()=>{
+        if(!drag) return;
+        if(moved){
+            try{ localStorage.setItem(KEY, JSON.stringify({left: btn.style.left, top: btn.style.top})); }catch(e){}
+        }
+        drag = null;
+        // moved 标志留给 click 拦截，下一帧清除
+        setTimeout(()=>{ moved = false; }, 0);
+    });
+    // ★ 2026-11-08：拖拽结束时浏览器仍会触发一次 click → 面板被误打开。
+    //   这里在**捕获阶段**拦掉这一次 click（本监听器注册早于 smOpenPanel 的 click）。
+    btn.addEventListener('click', (e)=>{
+        if(moved){
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            moved = false;
+        }
+    }, true);
+})();
 // 按钮文字动态显示当前缓存文件数与大小：清除X个文件（X MB）
 async function updateClearBtn(){
     if(!smClearBtn) return;
@@ -4538,7 +4718,7 @@ async function renderPathMessages(){if(currentMode!=='chat')return;   // ★ 防
 // 重绘前的滚动状态（回到原版语义：重绘后回到底部）
 const _sc0={t:messagesArea.scrollTop,h:messagesArea.scrollHeight,c:messagesArea.clientHeight};
 _sc0.atBottom=(_sc0.h-_sc0.t-_sc0.c)<=12;
-messagesArea.innerHTML='';if(!selectedNodeId)return;const pathIds=[];let cur=selectedNodeId;while(cur){pathIds.unshift(cur);cur=treeData.nodes[cur]?.parentId}const _missing=pathIds.filter(nid=>{const n=treeData.nodes[nid];return !n||(n.userMessage===undefined&&!n.generating)});if(_missing.length){await Promise.all(_missing.map(async nid=>{try{const res=await fetch(`${BASE_URL}/api/node/${nid}`);if(res.ok){const full=await res.json();if(full&&!full.error){if(!treeData.nodes[nid])treeData.nodes[nid]=full;else Object.assign(treeData.nodes[nid],full);}}}catch(e){}}));}pathIds.forEach(nid=>{const node=treeData.nodes[nid];if(!node)return;const userDiv=document.createElement('div');userDiv.className='message user-msg';const _tx = currentSearchTerm&&searchUserMsgCheck.checked ? (s)=>highlightText(s,currentSearchTerm) : null;userDiv.innerHTML=`<div class="bubble">${buildUserBubbleInner(node.userMessage, node.images, _tx)}</div>`;messagesArea.appendChild(userDiv);const assistantDiv=document.createElement('div');assistantDiv.className='message assistant-msg';assistantDiv.id='msg-'+nid;const bubbleDiv=document.createElement('div');bubbleDiv.className='bubble markdown-body';if(!node.generating&&(node.reasoning||node.assistantMessage)){if(node.reasoning){const rs=document.createElement('div');rs.className=rsCls();rs.innerHTML=`<div class="reasoning-header"><span>🧠 思考过程${(node.stopReason==='user_stop'||node.stopReason==='error')?'<span style="font-size:0.7rem;color:var(--tx-muted);font-weight:400;">（已中断）</span>':''}</span><span class="reasoning-duration">${node.reasoningDuration?node.reasoningDuration+'s':''}</span><span>${rsArrow()}</span></div><div class="${rscCls()}">${renderReasoningMarkdown(node.reasoning)}</div>`;bubbleDiv.appendChild(rs)}const ans=document.createElement('div');ans.className='answer-content';
+messagesArea.innerHTML='';if(!selectedNodeId)return;const pathIds=[];let cur=selectedNodeId;while(cur){pathIds.unshift(cur);cur=treeData.nodes[cur]?.parentId}const _missing=pathIds.filter(nid=>{const n=treeData.nodes[nid];return !n||(n.userMessage===undefined&&!n.generating)});if(_missing.length){await Promise.all(_missing.map(async nid=>{try{const res=await fetch(`${BASE_URL}/api/node/${nid}`);if(res.ok){const full=await res.json();if(full&&!full.error){if(!treeData.nodes[nid])treeData.nodes[nid]=full;else Object.assign(treeData.nodes[nid],full);}}}catch(e){}}));}pathIds.forEach(nid=>{const node=treeData.nodes[nid];if(!node)return;const userDiv=document.createElement('div');userDiv.className='message user-msg';const _tx = currentSearchTerm&&searchUserMsgCheck.checked ? (s)=>highlightText(s,currentSearchTerm) : null;userDiv.innerHTML=`<div class="bubble">${buildUserBubbleInner(node.userMessage, node.images, _tx)}</div>`;messagesArea.appendChild(userDiv);try{applyUserMsgCollapse(userDiv);}catch(e){}const assistantDiv=document.createElement('div');assistantDiv.className='message assistant-msg';assistantDiv.id='msg-'+nid;const bubbleDiv=document.createElement('div');bubbleDiv.className='bubble markdown-body';if(!node.generating&&(node.reasoning||node.assistantMessage)){if(node.reasoning){const rs=document.createElement('div');rs.className=rsCls();rs.innerHTML=`<div class="reasoning-header"><span>🧠 思考过程${(node.stopReason==='user_stop'||node.stopReason==='error')?'<span style="font-size:0.7rem;color:var(--tx-muted);font-weight:400;">（已中断）</span>':''}</span><span class="reasoning-duration">${node.reasoningDuration?node.reasoningDuration+'s':''}</span><span>${rsArrow()}</span></div><div class="${rscCls()}">${renderReasoningMarkdown(node.reasoning)}</div>`;bubbleDiv.appendChild(rs)}const ans=document.createElement('div');ans.className='answer-content';
 // ★ 2026-10-23：本轮没有回答时给明确提示，不要留一个空白气泡
 //   （用户实测：思考断了半句 + 下面全空，看着像坏了，实际是被「停止生成」取消）。
 if(node.assistantMessage && node.assistantMessage.length){
@@ -4555,7 +4735,26 @@ bubbleDiv.appendChild(ans);if(node.usage){const usageDiv=document.createElement(
 const reasonLabel=thinkingLevelLabel(node.thinkingEnabled, node.reasoningEffort);usageDiv.innerHTML=`🤖 模型：${modelLabel}  🧩 思考深度：${reasonLabel}  📊 输入(缓存命中): ${cached} tokens | 输入(未命中): ${prompt-cached} tokens | 输出: ${completion} tokens | 费用: ¥${costs.total.toFixed(6)}`;bubbleDiv.appendChild(usageDiv)}enhanceBubble(bubbleDiv,node.assistantMessage||'')}else{const ans=document.createElement('div');ans.className='answer-content';bubbleDiv.appendChild(ans)}assistantDiv.appendChild(bubbleDiv);messagesArea.appendChild(assistantDiv);if(node.generating){if(!pollingTimers[nid])pollNode(nid);startStream(nid)}});bindReasoningToggles(messagesArea);enhanceLinks(messagesArea);refreshProcFold();
 // 回到原版：重绘后回到底部（周期同步已不再重绘，不会打断阅读）
 userScrolledUp=false;smartScrollToBottom()}
-function appendUserMessage(text){const div=document.createElement('div');div.className='message user-msg';div.innerHTML=`<div class="bubble">${escapeHtml(text)}</div>`;messagesArea.appendChild(div);smartScrollToBottom()}
+// ★ 2026-11-08（按用户要求）：用户消息超过 8 行 → 折叠，点「展开」看全部。
+function applyUserMsgCollapse(msgEl){
+    try{
+        const b = msgEl.querySelector('.bubble');
+        if(!b || b.dataset.collapseReady) return;
+        b.dataset.collapseReady = '1';
+        const lineH = 1.62 * parseFloat(getComputedStyle(b).fontSize || '14');
+        if(b.scrollHeight <= lineH * 8 + 8) return;      // 8 行以内不折叠
+        b.classList.add('collapsed');
+        const btn = document.createElement('button');
+        btn.className = 'msg-expand-btn';
+        btn.textContent = '展开 ▾';
+        btn.addEventListener('click', ()=>{
+            const on = b.classList.toggle('collapsed');
+            btn.textContent = on ? '展开 ▾' : '收起 ▴';
+        });
+        msgEl.appendChild(btn);
+    }catch(e){}
+}
+function appendUserMessage(text){const div=document.createElement('div');div.className='message user-msg';div.innerHTML=`<div class="bubble">${escapeHtml(text)}</div>`;messagesArea.appendChild(div);applyUserMsgCollapse(div);smartScrollToBottom()}
 // ★ 用户气泡内联构建：图片缩略图 + 文件卡片作为附件行，显示在用户询问文字上方
 function extractFileCards(text){
     const cards=[];
@@ -4882,15 +5081,22 @@ async function checkTimerTasks() {
 
 // 发送消息
 async function sendMessage() {
-    const text = userInput.value.trim();
+    let text = userInput.value.trim();
     const imagesToSend = pendingImages.map(i => ({ name: i.name, mime: i.mime, data_url: i.data_url }));
+    // ★ 2026-11-08：无附件时同样要防止手打的 `[文件: ...]` 被当卡片渲染
+    const _typedSafe = String(text).replace(/\[文件:/g, '[文件\u200B:');
+    text = _typedSafe;   // 后续显示与发送统一用转义后的文本（真实附件由程序另行拼接）
 
     if (pendingFiles.length > 0 || pendingImages.length > 0) {
         const fileContents = await uploadAllFiles();
         if (!fileContents) return;
 
         const fileNamesStr = fileContents.map(f => f.name).join(', ');
-        const fullUserText = fileNamesStr ? (text ? `[文件: ${fileNamesStr}]\n${text}` : `[文件: ${fileNamesStr}]`) : text;
+        // ★ 2026-11-08：用户手打的 `[文件: xxx]` 不该被渲染成文件卡片（伪造）。
+        //   在 "[文件" 与 ":" 之间插入零宽空格 → 正则匹配不到，但肉眼完全看不出差别。
+        //   真实附件由下面这行程序拼接，不经过转义，卡片照常显示。
+        const _safeTyped = String(text).replace(/\[文件:/g, '[文件\u200B:');
+        const fullUserText = fileNamesStr ? (_safeTyped ? `[文件: ${fileNamesStr}]\n${_safeTyped}` : `[文件: ${fileNamesStr}]`) : _safeTyped;
 
         pendingFiles = [];
         pendingImages = [];
@@ -4936,7 +5142,12 @@ async function processChatMessage(userText, files = [], images = []) {
         const actualModel = data.model || selectedModelName();
         // ★ 本地节点立即带上图片（data_url），发送瞬间用户气泡即显示缩略图，无需等模型回答完
         treeData.nodes[data.nodeId] = { id: data.nodeId, parentId, title: '生成中...', userMessage: userText, assistantMessage: '', reasoning: '', reasoningDuration: null, model: actualModel, reasoningEffort: reasoningEffortSelect.value, thinkingEnabled: thinkingEnabled, generating: true, children: [], createdAt: Date.now(), images: (images || []).map(i => ({ name: i.name, mime: i.mime, data_url: i.data_url })) };
-        if (treeData.nodes[parentId]) treeData.nodes[parentId].children.push(data.nodeId);
+        if (treeData.nodes[parentId]) {
+            // ★ 2026-11-02：与服务端保持一致 —— 新对话排到孩子最前面
+            //   （服务端已改成 insert(0)，这里若还 push，就会出现
+            //    「先在末尾、下一次同步又跳到最前」的跳动）
+            treeData.nodes[parentId].children.unshift(data.nodeId);
+        }
         selectedNodeId = data.nodeId;
         localStorage.setItem(LAST_NODE_KEY, data.nodeId);
         renderTree();
@@ -5279,6 +5490,7 @@ function claimUserBubble(content){
 function appendUserBubble(content, images, claimed){    const div = document.createElement('div');
     div.className = 'message user-msg';
     div.innerHTML = `<div class="bubble">${buildUserBubbleInner(content, images || null)}</div>`;
+    try{ applyUserMsgCollapse(div); }catch(e){}   // ★ 长消息折叠（操作模式）
     try{
         div.dataset.umtext = _umFingerprint(content);
         div.dataset.umclaimed = claimed ? '1' : '0';
@@ -5291,6 +5503,9 @@ function appendUserBubble(content, images, claimed){    const div = document.cre
 // 1. 发送操作模式消息：支持图片（data_url）与文档（name+content）
 async function sendOperationMessage(userText, images = [], files = []) {
     if (!userText && !(images && images.length) && !(files && files.length)) return;
+    // ★ 2026-11-08：操作模式也别把用户手打的 `[文件: xxx]` 渲染成文件卡片（伪造）。
+    //   插一个零宽空格，肉眼无差；真实附件走 files 参数，不经过这里。
+    if (userText) userText = String(userText).replace(/\[文件:/g, '[文件\u200B:');
     if (!agentAvailable) {
         alert('本地代理未连接，无法发送操作命令。');
         return;
@@ -5597,11 +5812,16 @@ function showWaitTip(container, getAnswerDiv) {
     if (!target || !target.isConnected) return;
     // 避免重复添加
     if (target.querySelector('.thinking-wait-tip')) return;
+    // ★ 2026-11-02（用户要求）：提示要出现在**所有内容的最下面**。
+    //   原先 append 到 answerDiv（本白框第一个回答里）→ 看起来插在第一个回答下面。
+    //   改为挂到容器末尾。
+    const host = (box && box.isConnected) ? box : target;
+    if (host.querySelector('.thinking-wait-tip')) return;
     const tip = document.createElement('div');
     tip.className = 'thinking-wait-tip';
     tip.style.cssText = 'color:#64748b;font-size:0.85rem;margin-top:0.5rem;';
     tip.textContent = '⏳ 模型正在思考，请耐心等待...';
-    target.appendChild(tip);
+    host.appendChild(tip);
 }
 
 // 新增：清除等待提示和所有相关定时器
@@ -7828,7 +8048,7 @@ async function importOperationFile(file) {
 }
 
 // 模式切换
-modeSelect.addEventListener('change',()=>{const _prevMode=currentMode;_stashInput();currentMode=modeSelect.value;document.querySelectorAll('.agent-panel.fullscreen').forEach(p=>{p.classList.remove('fullscreen');const c=p.querySelector('.panel-fs-close');if(c)c.remove();});if(currentMode==='chat'){if(smOpen)smClosePanel();smOpenBtn.style.display='none';clearOpBtn.style.display='none';updateStopBtnLabel();document.getElementById('agentStatus').style.display='none';try{updateAgentVersionWarn(_lastAgentVersion);}catch(e){}document.getElementById('agentPanel').style.display='none';document.getElementById('processPanel').style.display='none';document.getElementById('planPanel').style.display='none';currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();clearAskQuestions();treeContainer.style.display='block';searchTrigger.style.display='';chatSettingsTrigger.style.display='';opSettingsTrigger.style.display='none';sessionInfoTrigger.style.display='none';searchArea.style.display='none';settingsContainer.style.display='flex';searchActive=false;treeHeader.style.display='flex';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出';importBtn.textContent='⬆️ 导入';inputArea.style.display='flex';if(_prevMode==='operation')_modeAreaSave.operation=_detachArea();_restoreArea('chat');hideActivationWizard();closeSessionInfo();_restoreInput();loadTree()}else{smOpenBtn.style.display='flex';clearOpBtn.style.display='inline-block';updateStopBtnLabel();document.getElementById('agentStatus').style.display='block';try{updateAgentVersionWarn(_lastAgentVersion);}catch(e){}document.getElementById('agentPanel').style.display='flex';document.getElementById('processPanel').style.display='flex';document.getElementById('planPanel').style.display='flex';renderAskPanel();currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();treeContainer.style.display='none';searchTrigger.style.display='none';chatSettingsTrigger.style.display='none';opSettingsTrigger.style.display='';sessionInfoTrigger.style.display='';searchArea.style.display='none';settingsContainer.style.display='flex';treeHeader.style.display='none';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出操作';importBtn.textContent='⬆️ 导入操作';if(_prevMode==='chat')_modeAreaSave.chat=_detachArea();const _opHad=_restoreArea('operation');if(!Array.isArray(operationTranscript))operationTranscript=[];if(!operationMeta||typeof operationMeta!=='object')operationMeta={model:'',reasoning_effort:'',thinking_enabled:true,session_id:null};if(agentAvailable){inputArea.style.display='flex';_restoreInput();if(!_opHad&&!operationChatInitialized){operationChatInitialized=true;_opArea().innerHTML='<div class="message assistant-msg"><div class="bubble">🖥️ 操作模式已激活</div></div>';}}else{inputArea.style.display='none';showActivationWizard()}}updateModeIndicator()});
+modeSelect.addEventListener('change',()=>{const _prevMode=currentMode;_stashInput();currentMode=modeSelect.value;document.querySelectorAll('.agent-panel.fullscreen').forEach(p=>{p.classList.remove('fullscreen');const c=p.querySelector('.panel-fs-close');if(c)c.remove();});if(currentMode==='chat'){if(smOpen)smClosePanel();smOpenBtn.style.display='none';clearOpBtn.style.display='none';updateStopBtnLabel();document.getElementById('agentStatus').style.display='none';try{updateAgentVersionWarn(_lastAgentVersion);}catch(e){}document.getElementById('agentPanel').style.display='none';document.getElementById('processPanel').style.display='none';document.getElementById('planPanel').style.display='none';currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();clearAskQuestions();treeContainer.style.display='block';searchTrigger.style.display='';chatSettingsTrigger.style.display='';opSettingsTrigger.style.display='none';sessionInfoTrigger.style.display='none';searchArea.style.display='none';settingsContainer.style.display='flex';searchActive=false;treeHeader.style.display='flex';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出';importBtn.textContent='⬆️ 导入';inputArea.style.display='flex';if(_prevMode==='operation')_modeAreaSave.operation=_detachArea();_restoreArea('chat');hideActivationWizard();closeSessionInfo();_restoreInput();loadTree()}else{smOpenBtn.style.display='flex';clearOpBtn.style.display='inline-block';updateStopBtnLabel();document.getElementById('agentStatus').style.display='block';try{updateAgentVersionWarn(_lastAgentVersion);}catch(e){}document.getElementById('agentPanel').style.display='flex';document.getElementById('processPanel').style.display='flex';document.getElementById('planPanel').style.display='flex';renderAskPanel();currentPlan=null;renderPlan(null);knownTasks=[];knownTimerTasks=[];renderProcessList();resetChildAgentState();treeContainer.style.display='none';searchTrigger.style.display='none';chatSettingsTrigger.style.display='none';opSettingsTrigger.style.display='';sessionInfoTrigger.style.display='';searchArea.style.display='none';settingsContainer.style.display='flex';treeHeader.style.display='none';importExportSection.style.display='flex';exportBtn.textContent='⬇️ 导出操作';importBtn.textContent='⬆️ 导入操作';if(_prevMode==='chat')_modeAreaSave.chat=_detachArea();const _opHad=_restoreArea('operation');_restoreInput();if(!Array.isArray(operationTranscript))operationTranscript=[];if(!operationMeta||typeof operationMeta!=='object')operationMeta={model:'',reasoning_effort:'',thinking_enabled:true,session_id:null};if(agentAvailable){inputArea.style.display='flex';_restoreInput();if(!_opHad&&!operationChatInitialized){operationChatInitialized=true;_opArea().innerHTML='<div class="message assistant-msg"><div class="bubble">🖥️ 操作模式已激活</div></div>';}}else{inputArea.style.display='none';showActivationWizard()}}updateModeIndicator()});
 // ==================== 会话属性面板（操作模式 💬 按钮） ====================
 // 展示：标题（可改，同时作为导出文件名） / 时间（忙碌·LLM·工具·等提问·首token·输出速度）
 //       用量（★ 按模型分开计费：Flash 与 Pro 各用各自单价） / 上下文占用组成部分
@@ -9001,9 +9221,34 @@ if(document.getElementById('opSettingsSave'))document.getElementById('opSettings
 //   写入记忆库（云端 server/workspace/memories + 本地 client/workspace/memories），
 //   与 #save 产物一致：#list 可直接看到、#load 可恢复上下文。
 let autoBackupTimer=null;
+// ★ 2026-11-07（按用户要求）：自动保存的兜底标题不要写死「操作任务」，
+//   改用**用户发的第一条消息**（和手动导出时的命名口径一致）。
+function _firstUserText(){
+    try{
+        const arr = (typeof linearMessages!=='undefined' && linearMessages) ? linearMessages : [];
+        for(const m of arr){
+            if(m && m.role==='user'){
+                const c = (typeof m.content==='string') ? m.content
+                        : (Array.isArray(m.content) ? (m.content.find(x=>x&&x.type==='text')||{}).text || '' : '');
+                const s = String(c||'').replace(/\s+/g,' ').trim();
+                if(s) return s.slice(0, 40);
+            }
+        }
+    }catch(e){}
+    return '';
+}
 function autosaveTitle(){
     let title='未命名';
-    if(currentPlan&&currentPlan.title)title=currentPlan.title;
+    // ★ 2026-11-07（修「操作模式的自动保存用了对话模式的标题」）：
+    //   原逻辑在没有 plan 时会回退到**聊天树当前节点标题**，
+    //   于是操作模式的备份被命名成对话模式里的主题（例：资源监视器绿蓝线区别）。
+    //   操作模式只用「操作会话自己的标题」，绝不碰聊天树。
+    if(currentMode==='operation'){
+        const _opTitle = (typeof operationTitleOverride!=='undefined'&&operationTitleOverride)
+            || (typeof sessionInfoTitleOverride!=='undefined'&&sessionInfoTitleOverride)
+            || (currentPlan&&currentPlan.title) || _firstUserText() || '操作任务';
+        title=_opTitle;
+    }else if(currentPlan&&currentPlan.title)title=currentPlan.title;
     else if(treeData&&selectedNodeId&&treeData.nodes[selectedNodeId]&&treeData.nodes[selectedNodeId].title&&treeData.nodes[selectedNodeId].title!=='新对话')title=treeData.nodes[selectedNodeId].title;
     return String(title).replace(/[\\/:*?"<>|\r\n\t]+/g,'_').replace(/^_+|_+$/g,'').slice(0,60)||'未命名';
 }
@@ -9045,8 +9290,13 @@ async function autoBackup(){
         const payload=buildBackupPayload();
         const fname=autosaveFileName();
         const title=autosaveTitle();
+        // ★ 2026-11-07：带上 session_id —— 服务端据此拿**完整内部消息**（含 tool_calls /
+        //   工具输出 / reasoning）。前端这份 payload 里只有 role+content，工具过程必然缺失。
+        if(currentMode==='operation' && operationSessionId) payload.session_id = operationSessionId;
+        const _body = {fname:fname,title:title,payload:payload};
+        if(currentMode==='operation' && operationSessionId) _body.session_id = operationSessionId;
         // 云端：写入 server/workspace/memories/（#list 可见）
-        try{await fetch(`${BASE_URL}/api/autosave`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fname:fname,title:title,payload:payload})});}catch(e){}
+        try{await fetch(`${BASE_URL}/api/autosave`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_body)});}catch(e){}
         // 本地：写入 client/workspace/memories/（经本地代理 #mem_save）
         if(agentAvailable){
             try{

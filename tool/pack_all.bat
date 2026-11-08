@@ -36,7 +36,7 @@ rem        数百 MB 无关 DLL 打进 exe，体积 370MB vs 精简版 21MB，�
 if not exist "%ROOT%\.backups\venv_pack\Scripts\python.exe" (
     echo [0/6] 创建精简打包 venv（首次需 2-4 分钟下载依赖）...
     "C:\ProgramData\Anaconda3\python.exe" -m venv "%ROOT%\.backups\venv_pack" || exit /b 1
-    "%ROOT%\.backups\venv_pack\Scripts\python.exe" -m pip install --quiet "openai==2.2.0" flask flask-cors chardet requests PyPDF2 python-docx openpyxl python-pptx pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 30 --disable-pip-version-check || exit /b 1
+    "%ROOT%\.backups\venv_pack\Scripts\python.exe" -m pip install --quiet "openai==2.2.0" flask flask-cors chardet requests PyPDF2 python-docx openpyxl python-pptx pyinstaller pystray pillow -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 30 --disable-pip-version-check || exit /b 1
     set "PYEXE=%ROOT%\.backups\venv_pack\Scripts\python.exe"
 )
 
@@ -64,6 +64,9 @@ mkdir "%ROOT%\.backups\pack\dist" >nul 2>nul
     --add-data "%ROOT%\server\static\tray.png;static" ^
     --add-data "%ROOT%\server\templates;templates" ^
     --add-data "%ROOT%\server\static;static" ^
+    --hidden-import pystray ^
+    --collect-submodules pystray ^
+    --collect-submodules PIL ^
     --distpath "%ROOT%\.backups\pack\dist" ^
     --workpath "%ROOT%\.backups\pack\build" ^
     --specpath "%ROOT%\.backups\pack" ^
@@ -95,6 +98,8 @@ echo [3/6] PyInstaller packaging client\agent.exe (with GUI/PIL bundled)...
     --add-data "%ROOT%\client\static\tray.png;static" ^
     --paths "%ROOT%\client\workspace\GUI" ^
     --add-data "%ROOT%\client\workspace\GUI;GUI" ^
+    --hidden-import pystray ^
+    --collect-submodules pystray ^
     --collect-submodules PIL ^
     --distpath "%ROOT%\.backups\pack\dist" ^
     --workpath "%ROOT%\.backups\pack\build" ^

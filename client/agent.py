@@ -1283,7 +1283,7 @@ def execute_legacy():
                 if not kw:
                     continue
                 try:
-                    seg = re.sub(re.escape(kw), '【%s】' % kw, seg, flags=re.IGNORECASE)
+                    seg = re.sub(re.escape(kw), '⟦%s⟧' % kw, seg, flags=re.IGNORECASE)
                 except Exception:
                     pass
             return ('…' if start > 0 else '') + seg + ('…' if end < len(text) else '')
