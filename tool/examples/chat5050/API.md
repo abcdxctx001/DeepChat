@@ -150,6 +150,15 @@ curl -b cookies.txt "http://127.0.0.1:5050/api/messages?limit=10"
 | GET | `/api/files/{id}` | 查看 / 下载附件 | 是 |
 | GET | `/api/admin/identities` | 权限名单（仅管理员） | 是 |
 | POST | `/api/admin/identities/{nickname}` | 修改角色 / 禁言 / 锁定（仅管理员） | 是 |
+| GET | `/api/desk/snapshot` | 桌面物件全量快照（分页） | 是 |
+| GET | `/api/desk/events` | 桌面增量 + 在线光标（长轮询） | 是 |
+| POST | `/api/desk/items` | 放置文字 / 图片 / 文件 / 笔画 | 是 |
+| PATCH | `/api/desk/items/{id}` | 移动 / 缩放 / 编辑 / 置顶 | 是 |
+| POST | `/api/desk/items/batch` | 批量移动 / 删除 / 改便签字号（多选、框选） | 是 |
+| DELETE | `/api/desk/items/{id}` | 软删除物件 | 是 |
+| POST | `/api/desk/items/{id}/restore` | 恢复已删除物件 | 是 |
+| POST | `/api/desk/cursor` | 上报光标与视野 | 是 |
+| POST | `/api/desk/leave` | 撤下自己的光标 | 是 |
 | PUT/PATCH/DELETE | `/api/messages/{id}` | 始终返回 405（只追加） | — |
 
 ---
@@ -403,6 +412,18 @@ curl -X POST http://127.0.0.1:5050/api/messages \
 - 最长 4000 字符（换行保留，`\r\n` 统一为 `\n`）；
 - 返回 `201`；
 - 每个昵称 10 秒最多 20 条，超出返回 `429` 与 `Retry-After: 10`。
+
+**v2.1 新增：引用已有附件。** 传 `attachment_id`（整数）时，会把桌面上（或之前上传过）的附件
+引用成一条线性消息，`kind` 由附件的 MIME 自动判定为 `image` / `file`；此时 `text` 可以为空。
+用于「桌面 → 线性流」的桥接，不需要重复上传文件。
+
+```bash
+curl -X POST http://127.0.0.1:5050/api/messages \
+  -H "Content-Type: application/json" \
+  -d '{"nickname":"alice","attachment_id":7,"text":"这张图也发到聊天里"}'
+```
+
+附件不存在返回 `404 not_found`，格式错误返回 `400 invalid_attachment`。
 
 ---
 
@@ -910,3 +931,218 @@ curl "http://127.0.0.1:5050/api/messages?nickname=alice&after_id=30&since_rev=20
   }
 }
 ```
+
+---
+
+## 19. 共享桌面 API（v2.1）
+
+线性消息是 append-only 的一维流；桌面是**同一份身份、同一份附件、同一套限流**之上的二维可变平面。
+两套内容互不相干：桌面物件不会变成消息，消息也不会自动出现在桌面上（除非显式「钉到桌面」）。
+
+所有 `/api/desk/*` 都需要昵称，规则见第 1 节。桌面写入同样受禁言约束；禁言者仍可读取与上报光标。
+
+### 19.1 数据模型
+
+`DeskItem`：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | int | 物件 ID，同时作为默认层级 |
+| `kind` | string | `text` / `image` / `file` / `stroke` |
+| `nickname`, `color` | string | 作者昵称与稳定颜色 |
+| `x`, `y` | float | 世界坐标（像素，zoom=1 时等于屏幕 px） |
+| `w`, `h` | float | 尺寸；便签 `h=0` 表示高度自适应 |
+| `z` | int | 层级，越大越靠前 |
+| `body` | string | 便签文字 / 图片说明 / 笔画点数组 JSON |
+| `style` | object | `color`、`note`（`#rrggbb`）、`width`（笔画粗细）、`fontSize`（该便签独立字号 10~96，缺省 18）、`source`（钉过来的来源） |
+| `attachment` | object \| null | 同第 2 节 `Attachment` |
+| `created_at`, `updated_at`, `updated_by` | | 时间戳与最后修改者 |
+| `rev` | int | 该物件最后一次变更的全局版本号 |
+| `deleted` | bool | 软删除标记 |
+
+笔画的 `body` 是 `[[dx,dy], ...]`，坐标相对 `(x, y)`，服务端会紧凑重排并算出 `w` / `h`。
+
+**同步模型**：`settings.desk_rev` 是全局单调版本号。每次创建 / 修改 / 删除都会自增，并把新值写进该行的 `rev`。
+客户端先拉快照拿 `rev`，再用 `since_rev` 拉增量；删除以 `deleted: true` 的墓碑下发。后写覆盖，不做 CRDT 合并。
+
+### 19.2 GET /api/desk/snapshot
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `before_id` | 极大值 | 分页游标，返回 `id < before_id` 的物件 |
+| `limit` | 400 | 1–500 |
+
+```json
+{
+  "ok": true,
+  "items": [ /* DeskItem，deleted=false，按 id 升序 */ ],
+  "count": 2,
+  "has_more": false,
+  "rev": 12,
+  "presence_rev": 31,
+  "presence": [ /* 在线光标 */ ],
+  "server_time": "…"
+}
+```
+
+`has_more=true` 时用本次最小 `id` 作为下一次的 `before_id`。**以第一页返回的 `rev` 作为增量起点**，
+分页期间发生的变化会被后续 `events` 补回来。
+
+### 19.3 GET /api/desk/events
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `since_rev` | 0 | 只返回 `rev > since_rev` 的物件（含删除墓碑） |
+| `since_presence` | 0 | 光标版本号，用于让长轮询也能被位置变化唤醒 |
+| `wait` | 0 | 0–25 秒；有变化立即返回 |
+| `limit` | 300 | 1–500 |
+
+```json
+{
+  "ok": true,
+  "items": [ /* 变化的 DeskItem */ ],
+  "count": 1,
+  "has_more": false,
+  "rev": 13,
+  "presence_rev": 44,
+  "presence": [
+    {
+      "client_id": "d3kf9a…",
+      "nickname": "bob",
+      "color": "#5ec4de",
+      "x": 420, "y": 260,
+      "cx": 400, "cy": 250,
+      "zoom": 1.25,
+      "viewport": {"x": 0, "y": -50, "w": 800, "h": 600},
+      "tool": "pen",
+      "idle": 0.3
+    }
+  ],
+  "server_time": "…"
+}
+```
+
+- 物件变化会立即唤醒长轮询；光标变化最多每 0.18 秒放行一次，避免打爆所有连接；
+- `has_more=true` 时，把 `state.rev` 推进到本次返回物件里最大的 `rev` 后立刻再请求，不要用响应里的全局 `rev`；
+- `presence` 是**全量快照**而不是增量，客户端按 `client_id` 覆盖即可；
+- 光标只存在进程内存，20 秒无心跳自动过期，因此**仍然必须单进程运行**。
+
+### 19.4 POST /api/desk/items
+
+两种方式：
+
+**JSON**（文字 / 笔画 / 引用已有附件）
+
+```bash
+curl -X POST http://127.0.0.1:5050/api/desk/items \
+  -H "Content-Type: application/json" \
+  -d '{"nickname":"alice","kind":"text","x":120,"y":80,
+       "w":260,"body":"看这里","style":{"note":"#2a3550","color":"#5b8cff"}}'
+```
+
+笔画：`"kind":"stroke"`，`body` 为点数组 JSON 字符串，`style` 带 `color` 与 `width`。
+图片 / 文件：`"kind":"image"` 或 `"file"` + `attachment_id`（引用 `attachments` 表里已有的 ID）。
+
+**multipart**（直接上传并放置）
+
+```bash
+curl -X POST http://127.0.0.1:5050/api/desk/items \
+  -F 'nickname=alice' \
+  -F 'meta={"kind":"image","x":50,"y":60,"w":320,"h":220,"body":"图注"}' \
+  -F 'file=@./photo.png'
+```
+
+`meta` 是 JSON 字符串；服务端按 MIME 自动决定最终 `kind`（SVG / HTML 一律降级为 `file` 卡片）。
+返回 `201` 与 `{ok, item, rev}`。
+
+限制：便签 2000 字符、笔画 1500 点 / 120 KB、坐标绝对值 ≤ 5,000,000、尺寸 ≤ 20,000。
+颜色只接受 `#rrggbb` 白名单，用户文本原样保存（前端用 `textContent` 渲染）。
+每个昵称 10 秒最多创建 40 个物件。
+
+### 19.5 PATCH /api/desk/items/{id}
+
+可改字段：`x` / `y` / `w` / `h` / `z` / `body` / `style`。
+
+```bash
+curl -X PATCH http://127.0.0.1:5050/api/desk/items/3 \
+  -H "Content-Type: application/json" \
+  -d '{"x":400,"y":120}'
+```
+
+- **移动 / 缩放**：任何未禁言用户都可以做（这是「共享桌面」的含义），`updated_by` 记录操作者；
+- **改内容 / 层级 / 删除**：仅作者或管理员；越权返回 `403 forbidden`；
+- **单独改一张便签的字号**：把 `fontSize` 放进 `style`（例如 `{"style":{"color":"#5b8cff","fontSize":36}}`）。
+  `style` 是整体替换，请带上要保留的其它字段；`fontSize` 只收数字，自动夹到 10~96，非法值退回 18。
+  便签正文按该值渲染，每张便签互不干扰；
+- 每个昵称 10 秒最多 120 次更新（拖动时节流上报）；
+- 返回 `{ok, item, rev}`。
+
+### 19.6 DELETE / POST /api/desk/items/{id}/restore
+
+软删除，返回带 `deleted: true` 的物件；后续 `events` 会下发墓碑让所有客户端移除它。
+`restore` 可反悔，仅作者或管理员可用。重复调用是幂等的。
+
+### 19.7 POST /api/desk/items/batch
+
+前端 `Ctrl` 多选 / 框选后，用**一次请求**移动、删除或统一改字号整个选择集，避免逐个 `PATCH` 触发限流。
+整批在同一个事务里完成，共用一个 `rev`，客户端只需拉一次增量。
+
+```bash
+curl -X POST http://127.0.0.1:5050/api/desk/items/batch?nickname=alice \
+  -H "Content-Type: application/json" \
+  -d '{"action":"move","items":[{"id":3,"x":400,"y":120},{"id":7,"x":460,"y":140}]}'
+
+# 把选中的几张便签统一改成 28px
+curl -X POST http://127.0.0.1:5050/api/desk/items/batch?nickname=alice \
+  -H "Content-Type: application/json" \
+  -d '{"action":"font_size","fontSize":28,"items":[{"id":3},{"id":7}]}'
+```
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `action` | `move`（只改 `x` / `y`）、`delete`（软删除）或 `font_size`（批量改便签字号），必填 |
+| `items` | 1~100 个物件；每项 `id` 必填为正整数，`move` 时另带 `x` / `y` |
+| `fontSize` | 仅 `font_size` 动作使用；数字 10~96，非法 / 缺省按 18 处理 |
+| `nickname` | 也可放在请求体里（规则同第 1 节） |
+
+规则与单个接口一致：
+
+- 禁言用户返回 `403 muted`；每个昵称 10 秒最多 60 次批量请求；
+- `move` 的位置任何人可改，坐标同样会被夹取，`updated_by` 记为操作者；
+- `delete` 只要批次里**含任一非本人且非管理员的物件就整批拒绝**（`403 forbidden`），不会删一半；
+- `font_size` 只作用于 `kind=text`，且限作者或管理员；批次里的非文字物件静默跳过，越权同样整批拒绝。
+  服务端把 `fontSize` **合并**进每张便签原有的 `style`（不会丢掉颜色 / 来源），单选时前端改走单个 `PATCH`；
+- 不存在的 id / 已删除的物件静默跳过；重复 id 自动去重；
+- 返回 `{ok, action, changed, items, font_size, rev}`，`items` 为变更后的物件（`delete` 时是墓碑），
+  `font_size` 在其它动作下为 `null`。
+
+### 19.8 POST /api/desk/cursor · /api/desk/leave
+
+```json
+{
+  "client_id": "d3kf9a2b",      // 每个标签页一个，[A-Za-z0-9_-]{4,64}
+  "x": 420, "y": 260,           // 鼠标的世界坐标
+  "cx": 400, "cy": 250,         // 相机中心（视野中心）的世界坐标
+  "zoom": 1.25,
+  "vw": 800, "vh": 600,         // 视野在世界坐标下的宽高
+  "tool": "pen"                 // 当前工具，可选
+}
+```
+
+`cursor` 返回 `{ok, presence_rev, rev}`；`leave` 只需 `client_id`，立刻撤下光标。
+两者都不写磁盘。建议空闲时每 5 秒心跳一次、移动时最多每 300 ms 一次。
+
+### 19.9 典型同步循环
+
+```text
+1. GET /api/desk/snapshot?limit=400        → 存 items，记下 rev / presence_rev
+2. 若 has_more，用最小 id 继续翻页
+3. GET /api/desk/events?since_rev=R&since_presence=P&wait=25
+   → upsert 变化物件（deleted 则移除）、覆盖 presence 列表
+   → R = 本次最大 item.rev（has_more 时）或响应 rev；P = presence_rev
+4. 回到 3
+```
+
+网页前端的 `static/desk.js` 就是这么做的，可以直接读它作为客户端参考实现。

@@ -1,61 +1,65 @@
 @echo off
-rem ============================================================
-rem  DeepChat 四件套一键打包（可重复执行）
-rem  产物：
-rem    1. server\app.exe             （由 server\app.py 打包，端口默认 5000）
-rem    2. client\agent.exe           （由 client\agent.py 打包，端口默认 5001）
-rem    3. server\workspace\client.zip（在旧包基础上仅替换 agent.py/agent.exe/run.bat）
-rem    4. server\workspace\server.zip（全新组装；workspace/settings.json 只写空 api_key 占位，不写真实 Key；
-rem                                  内含新 client.zip + app.exe + 最新前端模板）
-rem  说明：
-rem    - 若 server\app.exe 正被运行中的旧服务占用，会自动改存为 app_new.exe 并提示，
-rem      待旧服务停止后手动替换（或运行 tool\pack\replace_exe.bat）。
-rem    - 打包前的旧产物自动备份到 .backups\pack\backup_<时间戳>\
-rem ============================================================
 chcp 65001 >nul
+rem ============================================================
+rem  DeepChat one-click pack (safe to re-run)
+rem  Outputs:
+rem    1. server\app.exe               (from server\app.py,     port 5000)
+rem    2. client\agent.exe             (from client\agent.py,   port 5001)
+rem    3. server\workspace\client.zip  (incremental: agent.py/agent.exe/run.bat)
+rem  NOTE (2026-11-12, user request): server.zip is no longer assembled.
+rem        Installs go through tool\installer\make_installer.py (Setup.exe).
+rem  NOTE: if server\app.exe is locked by a running service, the new build is
+rem        saved as app_new.exe; run tool\pack\replace_exe.bat after stopping it.
+rem  NOTE: old artifacts are backed up to .backups\pack\backup_<timestamp>\
+rem
+rem  !!! THIS FILE MUST STAY PURE ASCII !!!
+rem  cmd.exe parses .bat with the OEM codepage (936 on zh-CN). Multi-byte UTF-8
+rem  Chinese in a comment shifts the byte stream and swallows the leading "rem "
+rem  of the NEXT line, so the rest of that comment gets executed as a command.
+rem  That bug popped a Notepad window with a .ps1 inside on every pack run.
+rem ============================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0.."
 set "ROOT=%CD%"
-set "BAK=%ROOT%\.backups\pack\backup_%date:~0,4%%date:~5,2%%date:~8,2%_%time:~0,2%%time:~3,2%%time:~6,2%"
-set "BAK=%BAK: =0%"
+rem 2026-11-11: build the timestamp SEPARATELY and only strip spaces from it.
+rem   Old code did `set "BAK=%BAK: =0%"` on the FULL path, which also replaced the
+rem   space in "DeepChat V2.2" -> "D:\download\DeepChat0V2.2\..." (a phantom 224MB
+rem   backup tree outside the project). PowerShell keeps it locale-independent.
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%i"
+if not defined TS set "TS=%date:~0,4%%date:~5,2%%date:~8,2%_%time:~0,2%%time:~3,2%%time:~6,2%"
+set "TS=%TS: =0%"
+set "BAK=%ROOT%\.backups\pack\backup_%TS%"
 
-rem ---- 选择 Python（含 PyInstaller）：优先使用精简打包 venv，避免 Anaconda 全家桶导致 exe 膨胀 10 倍 ----
+rem ---- pick a Python that has PyInstaller (prefer the slim pack venv) ----
 set "PYEXE="
+rem 2026-11-11: prefer an interpreter that already has PyInstaller; no more mandatory
+rem             .backups\venv_pack or Anaconda (that venv step always failed when conda absent).
 if exist "%ROOT%\.backups\venv_pack\Scripts\python.exe" set "PYEXE=%ROOT%\.backups\venv_pack\Scripts\python.exe"
 if not defined PYEXE (
-    if exist "C:\ProgramData\Anaconda3\python.exe" set "PYEXE=C:\ProgramData\Anaconda3\python.exe"
+    py -3.14 -m PyInstaller --version >nul 2>nul && set "PYEXE=py -3.14"
 )
 if not defined PYEXE (
-    py -3 -c "import sys;print(sys.executable)" >nul 2>nul && set "PYEXE=py -3"
+    py -3 -m PyInstaller --version >nul 2>nul && set "PYEXE=py -3"
 )
 if not defined PYEXE set "PYEXE=python"
-echo [0/6] Python: %PYEXE%
+echo [0/5] Python: %PYEXE%
 
-rem ---- 若尚无精简 venv，则自动创建（★ 重要：用 conda 全家桶打包会把 MKL/ICU 等
-rem        数百 MB 无关 DLL 打进 exe，体积 370MB vs 精简版 21MB，务必使用 venv） ----
-if not exist "%ROOT%\.backups\venv_pack\Scripts\python.exe" (
-    echo [0/6] 创建精简打包 venv（首次需 2-4 分钟下载依赖）...
-    "C:\ProgramData\Anaconda3\python.exe" -m venv "%ROOT%\.backups\venv_pack" || exit /b 1
-    "%ROOT%\.backups\venv_pack\Scripts\python.exe" -m pip install --quiet "openai==2.2.0" flask flask-cors chardet requests PyPDF2 python-docx openpyxl python-pptx pyinstaller pystray pillow -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 30 --disable-pip-version-check || exit /b 1
-    set "PYEXE=%ROOT%\.backups\venv_pack\Scripts\python.exe"
-)
-
-rem ---- 确保 PyInstaller ----
+rem ---- make sure PyInstaller exists ----
 %PYEXE% -m PyInstaller --version >nul 2>nul
 if errorlevel 1 (
-    echo [0/6] 未找到 PyInstaller，正在安装...
+    echo [0/5] PyInstaller not found, installing...
     %PYEXE% -m pip install pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 30 --disable-pip-version-check || exit /b 1
 )
 
-rem ---- 备份旧产物 ----
+rem ---- back up old artifacts ----
 mkdir "%BAK%" >nul 2>nul
-for %%F in ("server\app.exe" "server\app_new.exe" "client\agent.exe" "server\workspace\client.zip" "server\workspace\server.zip") do (
+for %%F in ("server\app.exe" "server\app_new.exe" "client\agent.exe" "server\workspace\client.zip") do (
     if exist "%ROOT%\%%~F" copy /y "%ROOT%\%%~F" "%BAK%\%%~nxF" >nul
 )
-echo [1/6] 旧产物已备份到 %BAK%
+echo [1/5] old artifacts backed up to %BAK%
 
-rem ---- 打包 server/app.exe ----
-echo [2/6] PyInstaller 打包 server\app.exe（需要 1-4 分钟）...
+rem ---- build server/app.exe ----
+echo [2/5] PyInstaller: server\app.exe (1-4 min)...
 mkdir "%ROOT%\.backups\pack\dist" >nul 2>nul
 %PYEXE% -m PyInstaller --noconfirm --clean --onefile --noconsole --name app ^
     --icon "%ROOT%\tool\launcher\icon.ico" ^
@@ -71,26 +75,25 @@ mkdir "%ROOT%\.backups\pack\dist" >nul 2>nul
     --workpath "%ROOT%\.backups\pack\build" ^
     --specpath "%ROOT%\.backups\pack" ^
     "%ROOT%\server\app.py"
-if errorlevel 1 ( echo [错误] app.exe 打包失败 & exit /b 1 )
+if errorlevel 1 ( echo [ERROR] app.exe build failed & exit /b 1 )
 copy /y "%ROOT%\.backups\pack\dist\app.exe" "%ROOT%\server\app.exe" >nul 2>nul
 if errorlevel 1 (
     copy /y "%ROOT%\.backups\pack\dist\app.exe" "%ROOT%\server\app_new.exe" >nul
-    echo [!] server\app.exe 正被占用（5000 端口服务运行中），新包已存为 server\app_new.exe
-    echo     待旧服务停止后，运行 tool\pack\replace_exe.bat 完成替换。
+    echo [!] server\app.exe is locked by a running service; saved as server\app_new.exe
+    echo     Stop the old service, then run tool\pack\replace_exe.bat.
 ) else (
-    echo [OK] server\app.exe 已更新
+    echo [OK] server\app.exe updated
 )
 
-rem ---- 打包 client/agent.exe ----
-rem ★ 2026-10-09: bundle the GUI dir (virtual_ui.py / ocr.ps1 / capture_dll / PIL).
+rem ---- build client/agent.exe ----
+rem 2026-10-09: bundle the GUI dir (virtual_ui.py / ocr.ps1 / capture_dll / PIL).
 rem   Why: virtual_ui.py does `from PIL import Image`. Source runs found PIL via
 rem   client/workspace/GUI on sys.path, but the packaged exe had NO GUI dir, so the
 rem   import failed and (before the try/except added in agent.py) it killed the whole
 rem   agent at startup, reporting a misleading "GUI dir missing" message.
 rem   agent.py resolves it as WORK_DIR/GUI first, then _MEIPASS/GUI -> the bundled
 rem   copy is the fallback and an external GUI dir still takes precedence.
-rem   (Keep this file ASCII-only: cmd parses .bat with the OEM codepage.)
-echo [3/6] PyInstaller packaging client\agent.exe (with GUI/PIL bundled)...
+echo [3/5] PyInstaller: client\agent.exe (GUI/PIL bundled)...
 %PYEXE% -m PyInstaller --noconfirm --clean --onefile --noconsole --name agent ^
     --icon "%ROOT%\tool\launcher\icon.ico" ^
     --add-data "%ROOT%\client\control.py;." ^
@@ -105,32 +108,27 @@ echo [3/6] PyInstaller packaging client\agent.exe (with GUI/PIL bundled)...
     --workpath "%ROOT%\.backups\pack\build" ^
     --specpath "%ROOT%\.backups\pack" ^
     "%ROOT%\client\agent.py"
-if errorlevel 1 ( echo [错误] agent.exe 打包失败 & exit /b 1 )
+if errorlevel 1 ( echo [ERROR] agent.exe build failed & exit /b 1 )
 copy /y "%ROOT%\.backups\pack\dist\agent.exe" "%ROOT%\client\agent.exe" >nul 2>nul
 if errorlevel 1 (
     copy /y "%ROOT%\.backups\pack\dist\agent.exe" "%ROOT%\client\agent_new.exe" >nul
-    echo [!] client\agent.exe 被占用，新包已存为 client\agent_new.exe
+    echo [!] client\agent.exe is locked; saved as client\agent_new.exe
 ) else (
-    echo [OK] client\agent.exe 已更新
+    echo [OK] client\agent.exe updated
 )
 
-rem ---- 更新 client.zip（增量替换 3 个文件）----
-echo [4/6] 更新 client.zip...
+rem ---- update client.zip (incremental: 7 files replaced) ----
+echo [4/5] updating client.zip...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\tool\pack\make_client_zip.ps1" -Root "%ROOT%" -AgentExeNew "%ROOT%\.backups\pack\dist\agent.exe"
-if errorlevel 1 ( echo [错误] client.zip 更新失败 & exit /b 1 )
+if errorlevel 1 ( echo [ERROR] client.zip update failed & exit /b 1 )
 
-rem ---- 全新组装 server.zip ----
-echo [5/6] 组装 server.zip（含新 client.zip / app.exe / 梗 api-key；约 1-4 分钟）...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\tool\pack\make_server_zip.ps1" -Root "%ROOT%" -AppExeNew "%ROOT%\.backups\pack\dist\app.exe"
-if errorlevel 1 ( echo [错误] server.zip 组装失败 & exit /b 1 )
-
-rem ---- 汇总 ----
+rem ---- summary ----
 echo.
-echo [6/6] ============ 打包完成 ============
-for %%F in ("server\app.exe" "server\app_new.exe" "client\agent.exe" "client\agent_new.exe" "server\workspace\client.zip" "server\workspace\server.zip") do (
+echo [5/5] ============ PACK DONE ============
+for %%F in ("server\app.exe" "server\app_new.exe" "client\agent.exe" "client\agent_new.exe" "server\workspace\client.zip") do (
     if exist "%ROOT%\%%~F" echo   %%~F   (%%~zF bytes)
 )
 echo.
-echo 备份目录：%BAK%
+echo backup dir: %BAK%
 endlocal
 if not "%1"=="-q" pause

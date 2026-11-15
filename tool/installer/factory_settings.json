@@ -1,0 +1,101 @@
+{
+  "flash_model": "deepseek-v4-flash",
+  "pro_model": "deepseek-v4-pro",
+  "base_url": "https://api.deepseek.com",
+  "api_key": "",
+  "prices": {
+    "flash": {
+      "cached": [
+        0.02,
+        0.04
+      ],
+      "uncached": [
+        1.0,
+        2.0
+      ],
+      "output": [
+        4.0,
+        8.0
+      ]
+    },
+    "pro": {
+      "cached": [
+        0.15,
+        0.3
+      ],
+      "uncached": [
+        4.5,
+        9.0
+      ],
+      "output": [
+        13.5,
+        27.0
+      ]
+    }
+  },
+  "web_tool_price_per_1k": 5.0,
+  "prompts": {
+    "chat_base": "",
+    "agent_base": "",
+    "child_base": "",
+    "sections": {}
+  },
+  "providers": [
+    {
+      "name": "DeepSeek",
+      "base_url": "https://api.deepseek.com",
+      "api_key": "",
+      "models": [
+        {
+          "alias": "flash",
+          "label": "flash",
+          "name": "deepseek-v4-flash",
+          "ctx": "1M",
+          "max_out": "384K",
+          "input_types": [
+            "text",
+            "image"
+          ],
+          "price": {
+            "cached": [
+              0.02,
+              0.04
+            ],
+            "uncached": [
+              1.0,
+              2.0
+            ],
+            "output": [
+              4.0,
+              8.0
+            ]
+          }
+        },
+        {
+          "alias": "pro",
+          "label": "pro",
+          "name": "deepseek-v4-pro",
+          "ctx": "1M",
+          "max_out": "384K",
+          "input_types": [
+            "text"
+          ],
+          "price": {
+            "cached": [
+              0.15,
+              0.3
+            ],
+            "uncached": [
+              4.5,
+              9.0
+            ],
+            "output": [
+              13.5,
+              27.0
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

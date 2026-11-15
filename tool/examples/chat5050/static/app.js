@@ -63,6 +63,8 @@
   const BASE_TITLE = `${GROUP} · Chat5050`;
 
   const state = {
+    // 默认线性；URL 带 #desk 时直接打开桌面（深链接，不改变默认值）
+    mode: location.hash === "#desk" ? "desk" : "linear",
     me: null,
     color: "#5b8cff",
     booted: false,
@@ -96,6 +98,82 @@
     rootNick: "root",
     adminLoading: false,
   };
+
+  // ------------------------------------------------------------------------
+  // 桥接层：desk.js（二维桌面）通过它复用身份、请求、消息流与视图切换。
+  // 线性视图本身不依赖桌面，桌面模块缺失时这里也不会报错。
+  // ------------------------------------------------------------------------
+
+  const bridgeListeners = new Map();
+  const bridge = {
+    state,
+    api,
+    toast,
+    formatTime,
+    fullTime,
+    initial,
+    linkify,
+    getMode: () => state.mode,
+    setMode: (mode) => setMode(mode),
+    getLinearMessages: () =>
+      Array.from(state.messages.values()).sort((a, b) => a.id - b.id),
+    sendLinearText: (text) => sendText(text),
+    on(name, fn) {
+      const list = bridgeListeners.get(name) || [];
+      list.push(fn);
+      bridgeListeners.set(name, list);
+      return () => {
+        bridgeListeners.set(
+          name,
+          (bridgeListeners.get(name) || []).filter((item) => item !== fn)
+        );
+      };
+    },
+    emit(name, detail) {
+      for (const fn of bridgeListeners.get(name) || []) {
+        try {
+          fn(detail);
+        } catch (err) {
+          console.error("桥接事件处理失败", name, err);
+        }
+      }
+      document.dispatchEvent(
+        new CustomEvent(`chat5050:${name}`, { detail })
+      );
+    },
+  };
+  window.Chat5050 = bridge;
+
+  function setMode(mode, force = false) {
+    const next = mode === "desk" ? "desk" : "linear";
+    if (state.mode === next && !force) return;
+    state.mode = next;
+    const isDesk = next === "desk";
+    document.querySelector(".app").classList.toggle("app--desk", isDesk);
+    const deskEl = $("desk");
+    if (deskEl) deskEl.hidden = !isDesk;
+    const linearBtn = $("modeLinear");
+    const deskBtn = $("modeDesk");
+    if (linearBtn) {
+      linearBtn.classList.toggle("is-active", !isDesk);
+      linearBtn.setAttribute("aria-selected", String(!isDesk));
+    }
+    if (deskBtn) {
+      deskBtn.classList.toggle("is-active", isDesk);
+      deskBtn.setAttribute("aria-selected", String(isDesk));
+    }
+    try {
+      history.replaceState(
+        null,
+        "",
+        isDesk ? "#desk" : location.pathname + location.search
+      );
+    } catch {
+      /* 某些环境禁用 history API，切换本身仍然可用 */
+    }
+    bridge.emit("mode", { mode: next });
+    if (!isDesk) requestAnimationFrame(() => scrollToBottom());
+  }
 
   // ------------------------------------------------------------------------
   // 工具
@@ -426,6 +504,9 @@
     meta.appendChild(time);
 
     const actions = [];
+    if (!message.recalled) {
+      actions.push(messageAction("钉到桌面", "pin-desk", message));
+    }
     if (canRecall(message)) {
       actions.push(messageAction("撤回", "recall", message, "danger"));
     }
@@ -585,6 +666,7 @@
       replaceMessageNode(next);
       applied += 1;
     }
+    if (applied) bridge.emit("messages", { changed: applied });
     return applied;
   }
 
@@ -593,6 +675,7 @@
       const data = await api(`/api/messages/${id}`);
       state.messages.set(id, data.message);
       replaceMessageNode(data.message);
+      bridge.emit("messages", { changed: 1 });
     } catch (err) {
       if (!handleAuthError(err)) console.warn("刷新消息失败", id, err);
     }
@@ -715,6 +798,7 @@
     meRole.hidden = !admin;
     if (!admin && !adminModal.hidden) closeAdminModal();
     applyMuteState(viewer);
+    bridge.emit("viewer", { viewer });
   }
 
   async function refreshMe() {
@@ -829,6 +913,7 @@
       state.unread += fresh.length;
       showNewPill();
     }
+    bridge.emit("messages", { changed: fresh.length });
     return fresh.length;
   }
 
@@ -1110,6 +1195,7 @@
         chatEl.scrollTop = previousTop + (chatEl.scrollHeight - previousHeight);
         state.stickBottom = false;
         updateEmptyState();
+        bridge.emit("messages", { changed: data.messages.length });
       } else {
         state.hasMore = false;
       }
@@ -1207,13 +1293,14 @@
     return false;
   }
 
-  async function sendText() {
+  async function sendText(override) {
     if (state.sending || !state.me) return;
     if (state.muted) {
       toast(muteLabel(state.viewer) || "你已被禁言", "error");
       return;
     }
-    const text = inputEl.value.replace(/\r\n/g, "\n").trim();
+    const source = typeof override === "string" ? override : inputEl.value;
+    const text = source.replace(/\r\n/g, "\n").trim();
     if (!text) {
       inputEl.focus();
       return;
@@ -1247,7 +1334,7 @@
     } finally {
       state.sending = false;
       sendBtn.disabled = state.muted;
-      if (!state.muted) inputEl.focus();
+      if (!state.muted && typeof override !== "string") inputEl.focus();
     }
   }
 
@@ -1440,6 +1527,10 @@
       toast(err.message || "加载消息失败", "error");
       setConnected(false);
     }
+    bridge.emit("enter", {
+      me: { nickname: state.me, color: state.color },
+      viewer: state.viewer,
+    });
     pollLoop();
   }
 
@@ -1742,6 +1833,14 @@
       "",
       "# 长轮询：有新消息 / 撤回事件立即返回（最多等 25 秒）",
       `curl "${base}/api/messages?nickname=alice&after_id=0&since_rev=0&wait=25"`,
+      "",
+      "# 共享桌面：在 (120, 80) 放一张便签",
+      `curl -X POST ${base}/api/desk/items \\`,
+      '  -H "Content-Type: application/json" \\',
+      `  -d '{"nickname":"alice","kind":"text","x":120,"y":80,"body":"看这里"}'`,
+      "",
+      "# 桌面增量（物件变化 + 他人光标）",
+      `curl "${base}/api/desk/events?nickname=alice&since_rev=0&wait=25"`,
     ].join("\n");
     apiModal.hidden = false;
   }
@@ -1760,6 +1859,22 @@
       if (!Number.isFinite(id)) return;
       if (action.dataset.act === "recall") recallMessage(id, true);
       if (action.dataset.act === "unrecall") recallMessage(id, false);
+      if (action.dataset.act === "pin-desk") {
+        const message = state.messages.get(id);
+        const desk = window.Chat5050Desk;
+        if (message && desk && typeof desk.pinMessage === "function") {
+          desk.pinMessage(message);
+        } else {
+          toast("桌面尚未就绪，请稍后再试", "error");
+        }
+      }
+    });
+
+    $("modeLinear").addEventListener("click", () => setMode("linear"));
+    $("modeDesk").addEventListener("click", () => setMode("desk"));
+    window.addEventListener("hashchange", () => {
+      const want = location.hash === "#desk" ? "desk" : "linear";
+      if (want !== state.mode) setMode(want);
     });
 
     nickForm.addEventListener("submit", async (event) => {
@@ -1899,23 +2014,23 @@
       );
 
     window.addEventListener("dragenter", (event) => {
-      if (!hasFiles(event)) return;
+      if (state.mode !== "linear" || !hasFiles(event)) return;
       event.preventDefault();
       state.dragDepth += 1;
       dropOverlay.hidden = false;
     });
     window.addEventListener("dragover", (event) => {
-      if (!hasFiles(event)) return;
+      if (state.mode !== "linear" || !hasFiles(event)) return;
       event.preventDefault();
       event.dataTransfer.dropEffect = "copy";
     });
     window.addEventListener("dragleave", (event) => {
-      if (!hasFiles(event)) return;
+      if (state.mode !== "linear" || !hasFiles(event)) return;
       state.dragDepth = Math.max(0, state.dragDepth - 1);
       if (state.dragDepth === 0) dropOverlay.hidden = true;
     });
     window.addEventListener("drop", (event) => {
-      if (!hasFiles(event)) return;
+      if (state.mode !== "linear" || !hasFiles(event)) return;
       event.preventDefault();
       state.dragDepth = 0;
       dropOverlay.hidden = true;
@@ -1948,6 +2063,7 @@
     updateCounter();
     updateEmptyState();
     setConnected(false);
+    setMode(state.mode, true);
 
     try {
       const group = await api("/api/group");

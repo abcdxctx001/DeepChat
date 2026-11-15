@@ -33,6 +33,145 @@ def _run_flags():
     return CREATE_NO_WINDOW if os.name == 'nt' else 0
 
 
+def _install_taskbar_watchdog(icon):
+    """explorer 重启后把托盘图标重新登记上（pystray 的 win32 后端不管这件事）。
+
+    ★ 2026-11-13：现象 —— explorer 崩溃/重启（或系统更新后重启外壳）时，任务栏
+      通知区域会被整体重建。我们之前用 Shell_NotifyIcon(NIM_ADD) 登记的图标不会
+      自动回来：进程照常在跑、服务照常工作，但托盘图标消失了。用户看到的就是
+      「程序在跑、找不到界面、只能看到一条提示」，实际上是图标没被重新登记。
+      pystray 的 Windows 后端只处理鼠标/菜单消息，不监听 TaskbarCreated。
+
+    做法：自己开一个**隐藏的顶层窗口**专门收 explorer 广播的 TaskbarCreated，
+      收到后把 pystray 的图标先摘再挂（visible=False → True），等于重新 NIM_ADD。
+      隐藏窗口是必须的：message-only 窗口收不到广播。
+
+    失败一律静默 —— 托盘图标能不能自动恢复属于体验问题，绝不能因此让面板起不来。
+    """
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return None
+
+    try:
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    except Exception:
+        return None
+
+    msg_id = user32.RegisterWindowMessageW('TaskbarCreated')
+    if not msg_id:
+        return None
+
+    LRESULT = ctypes.c_ssize_t
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                                 ctypes.c_size_t, LRESULT)
+
+    # ★ 必须显式声明签名：默认会把 64 位句柄/参数当 c_int 处理 ——
+    #   CreateWindowExW 的返回值被截断成 0（hwnd 为假），
+    #   DefWindowProcW 的 lparam 会抛 "int too long to convert"。
+    user32.DefWindowProcW.restype = LRESULT
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                      ctypes.c_size_t, LRESULT]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    user32.RegisterClassExW.restype = wintypes.ATOM
+    user32.PostMessageW.restype = wintypes.BOOL
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                    ctypes.c_size_t, LRESULT]
+
+    class WNDCLASSEXW(ctypes.Structure):
+        _fields_ = [
+            ('cbSize', wintypes.UINT),
+            ('style', wintypes.UINT),
+            ('lpfnWndProc', WNDPROC),
+            ('cbClsExtra', ctypes.c_int),
+            ('cbWndExtra', ctypes.c_int),
+            ('hInstance', wintypes.HINSTANCE),
+            ('hIcon', wintypes.HICON),
+            ('hCursor', wintypes.HANDLE),
+            ('hbrBackground', wintypes.HBRUSH),
+            ('lpszMenuName', wintypes.LPCWSTR),
+            ('lpszClassName', wintypes.LPCWSTR),
+            ('hIconSm', wintypes.HICON),
+        ]
+
+    def _reattach():
+        # pystray 的 visible setter 内部就是 NIM_DELETE / NIM_ADD，正好等于重新登记。
+        # 先摘再挂是因为 NIM_ADD 对已存在的 uID 会失败（explorer 重建后它认为不存在，
+        # 但我们这边的状态还是 visible=True，直接赋值 True 不会有任何动作）。
+        try:
+            icon.visible = False
+        except Exception:
+            pass
+        try:
+            icon.visible = True
+        except Exception:
+            pass
+
+    # ★ TaskbarCreated 是 explorer **同步**广播的：如果在窗口过程里直接调
+    #   Shell_NotifyIcon（icon.visible），就变成「explorer 等我们返回、我们等 explorer
+    #   处理 NIM_ADD」→ 双向死锁（实测 SendMessageTimeout 卡死，连超时都不生效）。
+    #   所以消息一到只投递一条自己定义的消息，立刻返回；等广播结束后再真正重登记。
+    WM_APP_REATTACH = 0x8000 + 1
+
+    def _wndproc(hwnd, msg, wparam, lparam):
+        try:
+            if msg == msg_id:
+                user32.PostMessageW(hwnd, WM_APP_REATTACH, 0, 0)
+                return 0
+            if msg == WM_APP_REATTACH:
+                _reattach()
+                return 0
+        except Exception:
+            pass
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    proc = WNDPROC(_wndproc)      # 必须留住引用，否则回调被 GC 后收到消息就崩
+    hinst = kernel32.GetModuleHandleW(None)
+    cls = 'DeepChatTrayWatch_%d_%d' % (os.getpid(), id(icon))
+    wc = WNDCLASSEXW()
+    wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+    wc.lpfnWndProc = proc
+    wc.hInstance = hinst
+    wc.lpszClassName = cls
+
+    holder = {}
+    ready = threading.Event()
+
+    def _loop():
+        # ★ 窗口必须**在本线程创建**：窗口消息只会进创建它的线程的消息队列。
+        #   之前先在调用者线程 CreateWindowEx、再另起线程 GetMessage，结果没人取消息，
+        #   explorer 的同步广播就一直等（实测 SendMessageTimeout 卡死）。
+        try:
+            if not user32.RegisterClassExW(ctypes.byref(wc)):
+                user32.UnregisterClassW(cls, hinst)
+                user32.RegisterClassExW(ctypes.byref(wc))
+            hwnd = user32.CreateWindowExW(0, cls, 'DeepChat', 0, 0, 0, 0, 0,
+                                          None, None, hinst, None)
+            holder['hwnd'] = hwnd
+        except Exception:
+            holder['hwnd'] = None
+        finally:
+            ready.set()
+        if not holder.get('hwnd'):
+            return
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    threading.Thread(target=_loop, daemon=True, name='tray-taskbar-watch').start()
+    ready.wait(1.5)               # 给窗口一点时间建好，但不阻塞启动
+    return holder.get('hwnd')
+
+
 def port_open(port, host='127.0.0.1'):
     """端口上是否已经有服务在监听。"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -422,7 +561,10 @@ def run_control_panel(services_spec, title='DeepChat 控制面板',
         def _icon(self):
             for name in ('icon.ico', 'icon.png'):
                 p = _icon_file(name)
-                if os.path.isfile(p):
+                # ★ 2026-11-08：图标文件可能不存在（例如安装包没带 static/），
+                #   _icon_file 返回 None，原来直接 os.path.isfile(None) 会抛
+                #   "path should be string ... not NoneType" 让面板整个起不来。
+                if p and os.path.isfile(p):
                     try:
                         if p.endswith('.ico'):
                             self.iconbitmap(p)
@@ -732,6 +874,11 @@ def run_control_panel(services_spec, title='DeepChat 控制面板',
                       MenuItem('退出（并停止服务）', quit_all)]
             self._tray = pystray.Icon('DeepChat', icon_img, title, Menu(*items))
             threading.Thread(target=self._tray.run, daemon=True).start()
+            # ★ 2026-11-13：explorer 重启后重新登记图标（pystray 不管 TaskbarCreated）
+            try:
+                _install_taskbar_watchdog(self._tray)
+            except Exception:
+                pass
             self.say('已最小化到托盘（双击托盘图标可重新打开）')
 
         def _quit_with_services(self):

@@ -8,6 +8,7 @@
   <title>{{ group_name }} · Chat5050</title>
   <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='desk.css') }}">
 </head>
 <body data-max-upload="{{ max_upload_mb }}" data-max-text="{{ max_text }}">
   <div class="app">
@@ -26,6 +27,24 @@
       </div>
 
       <div class="topbar-right">
+        <div class="mode-switch" id="modeSwitch" role="tablist" aria-label="视图模式">
+          <button class="mode-btn is-active" id="modeLinear" type="button" role="tab" aria-selected="true" title="线性消息流（默认）">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+              <path d="M4 6h16M4 11h16M4 16h10M4 21h7"/>
+            </svg>
+            <span>线性</span>
+          </button>
+          <button class="mode-btn" id="modeDesk" type="button" role="tab" aria-selected="false" title="切换到二维共享桌面">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="4" width="18" height="14" rx="2"/>
+              <path d="M8 21h8M12 18v3"/>
+              <path d="m7 13 3-4 2.5 2.5L15 8l2 5"/>
+            </svg>
+            <span>桌面</span>
+            <span class="mode-badge" id="deskBadge" hidden></span>
+          </button>
+        </div>
+
         <div class="online-wrap">
           <button class="online" id="onlineWrap" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="onlinePanel" title="查看在线成员">
             <span class="conn-dot" id="connDot" aria-hidden="true"></span>
@@ -95,6 +114,185 @@
         有新消息 <span aria-hidden="true">↓</span>
       </button>
     </main>
+
+    <!-- ================= 共享桌面（二维视图） ================= -->
+    <section class="desk" id="desk" hidden aria-label="共享桌面">
+      <div class="desk-viewport" id="deskViewport" tabindex="0" aria-label="无限画布">
+        <div class="desk-grid" id="deskGrid" aria-hidden="true"></div>
+        <div class="desk-world" id="deskWorld">
+          <div class="desk-layer" id="deskItems"></div>
+          <div class="desk-layer desk-layer--views" id="deskViews"></div>
+          <div class="desk-layer desk-layer--cursors" id="deskCursors"></div>
+        </div>
+        <div class="desk-live-stroke" id="deskLiveStroke" aria-hidden="true" hidden>
+          <svg id="deskLiveSvg"><polyline id="deskLivePolyline" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div class="desk-marquee" id="deskMarquee" hidden aria-hidden="true"></div>
+      </div>
+
+      <!-- 左侧工具箱 -->
+      <div class="desk-tools" id="deskTools" role="toolbar" aria-label="桌面工具">
+        <button class="desk-tool is-active" data-tool="select" type="button" title="选择 / 移动 (V)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 3 14 8-6.5 1.5L9 19 5 3Z"/></svg>
+        </button>
+        <button class="desk-tool" data-tool="marquee" type="button" title="框选多个物件 (M)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="4 3"/><path d="M9 12h6M12 9v6"/></svg>
+        </button>
+        <button class="desk-tool" data-tool="hand" type="button" title="抓手 / 平移 (H)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V6a1.5 1.5 0 0 1 3 0v5-6a1.5 1.5 0 0 1 3 0v6-4a1.5 1.5 0 0 1 3 0v5-2a1.5 1.5 0 0 1 3 0v4.5A6.5 6.5 0 0 1 13.5 21H11a6 6 0 0 1-4.5-2L4 16.3a1.6 1.6 0 0 1 2.3-2.2L8 15.5"/></svg>
+        </button>
+        <div class="desk-tool-sep"></div>
+        <button class="desk-tool" data-tool="text" type="button" title="文字便签 (T)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6V4h16v2M12 4v16M9 20h6"/></svg>
+        </button>
+        <button class="desk-tool" data-tool="pen" type="button" title="画笔 (P)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z"/><path d="m14 6 3 3"/></svg>
+        </button>
+        <button class="desk-tool" data-tool="eraser" type="button" title="橡皮 (E)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 15 8.5-8.5a2 2 0 0 1 2.8 0l4.2 4.2a2 2 0 0 1 0 2.8L14 19H8l-4-4Z"/><path d="M9 9.5 15.5 16M14 19h7"/></svg>
+        </button>
+        <button class="desk-tool" data-tool="file" type="button" title="放置图片 / 文件 (U)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.4 11.6 12.3 20.7a5.4 5.4 0 0 1-7.6-7.6l9.2-9.2a3.6 3.6 0 0 1 5.1 5.1l-9.2 9.2a1.8 1.8 0 0 1-2.6-2.6l8.4-8.4"/></svg>
+        </button>
+        <div class="desk-tool-sep"></div>
+        <button class="desk-tool" id="deskHelpBtn" type="button" title="快捷键与帮助">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.6 2.6 0 1 1 3.4 2.5c-.7.3-1 .9-1 1.6v.4M12 17h.01"/></svg>
+        </button>
+      </div>
+
+      <!-- 工具属性：颜色 + 笔宽 -->
+      <div class="desk-options" id="deskOptions">
+        <div class="desk-palette" id="deskPalette" aria-label="颜色"></div>
+        <label class="desk-width-wrap" title="画笔粗细">
+          <span>粗细</span>
+          <input type="range" id="deskWidth" min="1" max="18" step="1" value="3">
+          <span id="deskWidthLabel">3</span>
+        </label>
+      </div>
+
+      <!-- 选中文字便签后的独立字号条（每张便签各存各的，互不影响） -->
+      <div class="desk-fontbar" id="deskFontBar" hidden aria-label="便签字号">
+        <span class="desk-fontbar-label">便签字号</span>
+        <span class="desk-fontbar-scope" id="deskFontScope">1 张</span>
+        <button class="desk-fontbar-btn" id="deskFontMinus" type="button" title="缩小字号 ( [ )">A−</button>
+        <input class="desk-fontbar-value" id="deskFontValue" type="number" min="10" max="96" step="1" value="18" aria-label="字号，像素">
+        <span class="desk-fontbar-unit">px</span>
+        <button class="desk-fontbar-btn" id="deskFontPlus" type="button" title="放大字号 ( ] )">A+</button>
+        <div class="desk-fontbar-presets" id="deskFontPresets">
+          <button type="button" data-size="14">小</button>
+          <button type="button" data-size="18">标准</button>
+          <button type="button" data-size="28">大</button>
+          <button type="button" data-size="48">特大</button>
+        </div>
+        <button class="desk-fontbar-close" id="deskFontClose" type="button" title="取消选择">×</button>
+      </div>
+
+      <!-- 顶部状态条 -->
+      <div class="desk-hud" id="deskHud">
+        <span class="desk-hud-title">
+          <span class="desk-live-dot" id="deskLiveDot"></span>共享桌面
+        </span>
+        <span class="desk-hud-hint" id="deskHintText">滚轮平移 · Ctrl/⌘ + 滚轮缩放 · 双击空白写便签</span>
+        <span class="desk-hud-spacer"></span>
+        <span class="desk-hud-muted" id="deskMuted" hidden>已被禁言 · 仅可浏览</span>
+        <span class="desk-coords" id="deskCoords">0, 0</span>
+        <button class="desk-chip" id="deskViewsToggle" type="button" title="显示 / 隐藏他人视野">视野</button>
+        <button class="desk-chip" id="deskDrawerToggle" type="button" title="打开线性消息流">聊天流<span class="desk-chip-dot" id="deskDrawerDot" hidden></span></button>
+        <button class="desk-chip desk-chip--primary" id="deskBackBtn" type="button">返回线性</button>
+      </div>
+
+      <!-- 正在桌面上的人 -->
+      <div class="desk-people" id="deskPeople" aria-label="桌面上的成员"></div>
+
+      <!-- 缩放 -->
+      <div class="desk-zoom" id="deskZoom">
+        <button id="deskZoomOut" type="button" title="缩小">−</button>
+        <button id="deskZoomLabel" type="button" title="恢复 100%">100%</button>
+        <button id="deskZoomIn" type="button" title="放大">+</button>
+        <span class="desk-zoom-sep"></span>
+        <button id="deskZoomFit" type="button" title="适应全部内容">适应</button>
+        <button id="deskZoomHome" type="button" title="回到原点">原点</button>
+      </div>
+
+      <!-- 小地图 -->
+      <div class="desk-minimap" id="deskMinimap">
+        <div class="desk-minimap-head"><span>全图</span><span id="deskMinimapCount">0 个物件</span></div>
+        <canvas id="deskMinimapCanvas" width="240" height="150" aria-label="桌面缩略图"></canvas>
+        <div class="desk-minimap-foot">点击可移动视角</div>
+      </div>
+
+      <!-- 空状态 -->
+      <div class="desk-empty" id="deskEmpty" hidden>
+        <div class="desk-empty-icon" aria-hidden="true">
+          <svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="10" width="52" height="38" rx="4"/><path d="M6 40l13-12 9 8 8-10 16 14"/><circle cx="43" cy="23" r="4"/><path d="M22 55h20M32 48v7"/></svg>
+        </div>
+        <h2>桌面还是空的</h2>
+        <p>这里没有「上一条 / 下一条」，只有坐标。挑个位置放下第一件东西。</p>
+        <div class="desk-empty-actions">
+          <button type="button" data-quick="text">写张便签</button>
+          <button type="button" data-quick="file">放置文件</button>
+          <button type="button" data-quick="pen">随手涂鸦</button>
+        </div>
+      </div>
+
+      <!-- 便签编辑器 -->
+      <div class="desk-editor" id="deskEditor" hidden>
+        <textarea id="deskEditorInput" maxlength="2000" placeholder="写点什么…" spellcheck="false"></textarea>
+        <div class="desk-editor-font">
+          <span>字号</span>
+          <button class="desk-fontbar-btn" id="deskEditorFontMinus" type="button" title="缩小">A−</button>
+          <input class="desk-fontbar-value" id="deskEditorFontValue" type="number" min="10" max="96" step="1" value="18" aria-label="这张便签的字号">
+          <span class="desk-fontbar-unit">px</span>
+          <button class="desk-fontbar-btn" id="deskEditorFontPlus" type="button" title="放大">A+</button>
+          <span class="desk-editor-font-tip">只影响这一张</span>
+        </div>
+        <div class="desk-editor-foot">
+          <span class="desk-editor-tip">Ctrl/⌘ + Enter 保存 · Esc 取消</span>
+          <button class="desk-editor-btn" id="deskEditorCancel" type="button">取消</button>
+          <button class="desk-editor-btn desk-editor-btn--primary" id="deskEditorSave" type="button">放到桌面</button>
+        </div>
+      </div>
+
+      <!-- 物件右键菜单 -->
+      <div class="desk-menu" id="deskMenu" hidden></div>
+
+      <!-- 帮助 -->
+      <div class="desk-help" id="deskHelp" hidden>
+        <h3>共享桌面 · 快捷键</h3>
+        <ul>
+          <li><kbd>V</kbd> 选择 / 移动　<kbd>H</kbd> 抓手　<kbd>T</kbd> 便签</li>
+          <li><kbd>P</kbd> 画笔　<kbd>E</kbd> 橡皮　<kbd>U</kbd> 文件　<kbd>M</kbd> 框选</li>
+          <li><kbd>Space</kbd> + 拖动 / 中键拖动 = 平移</li>
+          <li>滚轮 = 平移，<kbd>Ctrl</kbd>/<kbd>⌘</kbd> + 滚轮 = 缩放</li>
+          <li>双击空白处 = 新建便签；双击便签 = 编辑</li>
+          <li><kbd>Ctrl</kbd>/<kbd>⌘</kbd> + 点击 = 加减选中；<kbd>Shift</kbd> + 拖空白 = 框选</li>
+          <li><kbd>Ctrl</kbd>+<kbd>A</kbd> 全选　<kbd>Delete</kbd> 删除选中（可多个）</li>
+          <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤销删除　<kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> = 缩放 / 复位</li>
+          <li>选中便签后出现字号条：<kbd>[</kbd> / <kbd>]</kbd> 也能逐张调字号</li>
+          <li>拖拽文件到画布、或截图后 <kbd>Ctrl</kbd>+<kbd>V</kbd> 粘贴</li>
+        </ul>
+        <p>所有人共享同一张画布。你可以移动任何物件；修改内容或删除则只有作者与管理员能做。每张文字便签的字号单独保存，互不影响。</p>
+      </div>
+
+      <!-- 拖放提示 -->
+      <div class="desk-drop" id="deskDrop" hidden><div>松开即可放到这个位置</div></div>
+
+      <!-- 线性流抽屉：桌面模式下不丢失线性聊天 -->
+      <aside class="desk-drawer" id="deskDrawer" hidden aria-label="线性消息流">
+        <header class="desk-drawer-head">
+          <span>线性流</span>
+          <button id="deskDrawerClose" type="button" aria-label="关闭聊天流">×</button>
+        </header>
+        <div class="desk-drawer-list" id="deskDrawerList"></div>
+        <form class="desk-drawer-form" id="deskDrawerForm" autocomplete="off">
+          <input id="deskDrawerInput" type="text" maxlength="4000" placeholder="发到线性流…" spellcheck="false">
+          <button type="submit" aria-label="发送">↑</button>
+        </form>
+        <div class="desk-drawer-foot">与「线性」视图是同一条消息流</div>
+      </aside>
+
+      <input type="file" id="deskFileInput" multiple hidden>
+    </section>
 
     <footer class="composer">
       <div class="mute-notice" id="muteNotice" hidden>
@@ -194,6 +392,7 @@
         <li>长轮询：<code>?after_id=&amp;since_rev=&amp;wait=25</code>，有新消息或撤回 / 权限变更立即返回。</li>
         <li>撤回：<code>POST /api/messages/{id}/recall</code>；撤销：<code>/unrecall</code>（本人或管理员）。</li>
         <li>权限：<code>GET /api/admin/identities</code>、<code>POST /api/admin/identities/{nickname}</code>，带 <code>X-Chat-Client: api</code> 时不受昵称锁限制。</li>
+        <li>共享桌面：<code>GET /api/desk/snapshot</code>、<code>GET /api/desk/events</code>、<code>POST /api/desk/items</code>，光标用 <code>POST /api/desk/cursor</code> 上报。</li>
       </ul>
 
       <div class="api-links">
@@ -245,5 +444,6 @@
   <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
 
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='desk.js') }}" defer></script>
 </body>
 </html>

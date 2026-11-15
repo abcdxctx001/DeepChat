@@ -1,4 +1,4 @@
-import os, json, subprocess, platform, time, re, chardet, socket, threading, logging, sys, uuid, queue, requests, types, zipfile, io, html, traceback, copy
+import os, json, subprocess, platform, time, re, chardet, socket, threading, logging, sys, uuid, queue, requests, types, zipfile, io, html, traceback, copy, hashlib
 import flask
 import contextvars
 from flask import Flask, render_template, request, Response, stream_with_context, jsonify, send_from_directory, send_file, make_response
@@ -105,6 +105,12 @@ class HTMLToTextParser(HTMLParser):
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+# ★ 2026-11-12：源码运行时打开模板自动重载。
+#   原来是 Flask 默认（跟着 debug 走，这里 debug=False）→ 模板改完必须重启进程才生效，
+#   开发/验证时很容易出现"改了没反应、怀疑代码没写对"的误判（今天已经踩了两次）。
+#   打包成 exe 后保持缓存：线上不需要热更新，也省掉每次请求的 stat。
+if not getattr(sys, 'frozen', False):
+    app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 # ★ 日志初始化加固（配合 exe 以「无控制台」方式运行）：
 #   PyInstaller 的 --noconsole 构建里 sys.stderr 可能是 None，
@@ -236,19 +242,81 @@ def _norm_model(m, idx=0):
         "price": _norm_price(m.get("price")),
     }
 
+def _provider_id_for(name, base_url):
+    """生成提供商的**稳定标识**（问题1/问题2 的基石）。
+
+    ★ 2026-11-11（致命资金 Bug：选 flash1 却扣了 flash 的 Key）
+      根因不是"用了全局 client"，而是**身份识别用错了东西**：前端发给服务端的是
+      真实模型名，而"DeepSeek/flash"与"deepseek1/flash1"两家的模型名完全一样
+      （都是 deepseek-chat / deepseek-v4-flash），resolve_model() 只能命中第一个
+      提供商 → 用的自然是 Key A。
+      修法：给每个提供商一个与"下标"无关的稳定 id（名称+base_url 的哈希），
+      请求时把它一起带上来，服务端**只认 id**，绝不再靠模型名猜是张三还是李四。
+      用哈希而不是下标的原因：删除/拖动卡片会让下标整体平移，而 id 不变。
+    """
+    raw = f"{(name or '').strip().lower()}\x00{(base_url or '').strip().lower()}"
+    return "p_" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+
 def _norm_provider(pr, idx=0):
     """规整单个提供商配置（含其模型列表）。"""
     pr = pr if isinstance(pr, dict) else {}
     models = pr.get("models")
     if not isinstance(models, list):
         models = []
+    _name = str(pr.get("name") or "").strip() or f"{DEFAULT_PROVIDER_NAME}{idx + 1 if idx else ''}"
+    _base = str(pr.get("base_url") or "").strip()
+    # ★ 2026-11-13：前端新建卡片用的是临时 id（tmp_xxx），**绝不能落盘** ——
+    #   否则下次启动就会有个"名字哈希对不上任何东西"的僵尸身份。
+    _id = str(pr.get("id") or "").strip()
+    if _id.startswith("tmp_"):
+        _id = ""
     return {
-        "name": str(pr.get("name") or "").strip() or f"{DEFAULT_PROVIDER_NAME}{idx + 1 if idx else ''}",
-        "base_url": str(pr.get("base_url") or "").strip(),
+        # ★ 问题1：id 一旦存在就**永不重算**（用户改了名字也只改显示，id 不变），
+        #   否则"改个名"就会让所有正在跑的会话指向一个不存在的提供商。
+        "id": _id or _provider_id_for(_name, _base),
+        "name": _name,
+        "base_url": _base,
         "api_key": str(pr.get("api_key") or "").strip(),
         "enabled": bool(pr.get("enabled", True)),
         "models": [_norm_model(m, k) for k, m in enumerate(models)],
     }
+
+def _find_old_provider(old_provs, cp, idx):
+    """在磁盘上的旧 providers 里找出"同一个提供商"（用于保留真实 api_key）。
+
+    ★ 2026-11-13（修「A 家的 key 被写进 B 家 / key 莫名其妙变了」）：
+      原来这里**只按下标**取旧配置：
+          _prev = _old_provs[_i].get('api_key')
+      而前端提交的 providers 顺序会随"增删卡片、新建提供商"整体平移，
+      下标一错位，脱敏提交（************abcd）就会被换成**别家**的真 key ——
+      界面上表现为"我没改过 key，怎么变成另一串了""这家 key 突然无效"。
+      现在按 id → 名称+地址 → 地址 → 下标 依次匹配，匹配不上就不保留（宁可空，
+      也不要张冠李戴：空 key 会明确报"未配置"，串 key 会静默扣别人家的钱）。
+    """
+    old_provs = [x for x in (old_provs or []) if isinstance(x, dict)]
+    if not old_provs:
+        return {}
+    _id = str(cp.get("id") or "").strip()
+    if _id and not _id.startswith("tmp_"):
+        for op in old_provs:
+            if str(op.get("id") or "").strip() == _id:
+                return op
+    _nm = str(cp.get("name") or "").strip()
+    _bu = str(cp.get("base_url") or "").strip().rstrip("/")
+    if _nm or _bu:
+        for op in old_provs:
+            if (str(op.get("name") or "").strip() == _nm
+                    and str(op.get("base_url") or "").strip().rstrip("/") == _bu):
+                return op
+    if _bu:
+        _hit = [op for op in old_provs
+                if str(op.get("base_url") or "").strip().rstrip("/") == _bu]
+        if len(_hit) == 1:
+            return _hit[0]
+    if 0 <= idx < len(old_provs):
+        return old_provs[idx]
+    return {}
+
 
 def _legacy_to_providers(st):
     """把老的扁平设置迁移成 providers 列表（只读，不写盘）。"""
@@ -281,15 +349,58 @@ def get_providers():
     if isinstance(provs, list) and provs:
         out = [_norm_provider(x, i) for i, x in enumerate(provs)]
         # 补：老 api_key 若在 provider 里为空，用它兜底
+        # ★ 2026-11-11（问题1 附带发现）：兜底必须加**域名条件**。
+        #   原来无条件兜底，于是"本地 Ollama（无 key）"会被塞上 DeepSeek 的 Key A ——
+        #   请求虽然发到 127.0.0.1 没造成扣费，但这正属于"用 A 家的凭据去访问 B 家"，
+        #   是同一种身份串号。现在只有"没写 base_url"或"就是同一个域名"时才兜底。
         legacy_key = (st.get("api_key") or "").strip() or _read_legacy_api_key()
         legacy_base = (st.get("base_url") or "").strip()
+        _lb = legacy_base.rstrip('/').lower()
         for x in out:
-            if not x["api_key"] and legacy_key:
+            _xb = (x.get("base_url") or "").rstrip('/').lower()
+            _same_endpoint = (not _xb) or (_lb and _xb == _lb)
+            if not x["api_key"] and legacy_key and _same_endpoint:
                 x["api_key"] = legacy_key
             if not x["base_url"] and legacy_base:
                 x["base_url"] = legacy_base
+        # ★ 问题1：极端情况下两家可能同名同 base_url（复制粘贴出来的卡片）——
+        #   id 会撞。这里按出现顺序加后缀，保证"同一份配置里 id 唯一"。
+        _seen = {}
+        for x in out:
+            _id = x["id"]
+            if _id in _seen:
+                _seen[_id] += 1
+                x["id"] = f"{_id}_{_seen[_id]}"
+            else:
+                _seen[_id] = 1
         return out
     return _legacy_to_providers(st)
+
+
+def get_provider_by_id(provider_id, providers=None):
+    """按 id（也兼容旧调用：名称 / 下标字符串）取提供商；取不到返回 None。
+
+    ★ 问题1 的核心入口。只认明确身份，**绝不**用"模型名"拐着弯推断 ——
+      两家模型名相同时那样必然串号。
+    """
+    pid = str(provider_id or "").strip()
+    if not pid:
+        return None
+    provs = providers if isinstance(providers, list) else get_providers()
+    # ① 稳定 id
+    for pr in provs:
+        if pr.get("id") == pid:
+            return pr
+    # ② 名称（前端/旧版可能只发名字）
+    for pr in provs:
+        if (pr.get("name") or "") == pid:
+            return pr
+    # ③ 下标（兼容 /api/api_balance?provider=0 这类老调用）
+    if pid.isdigit():
+        i = int(pid)
+        if 0 <= i < len(provs):
+            return provs[i]
+    return None
 
 def iter_models():
     """遍历所有 (提供商, 模型) 对。"""
@@ -297,12 +408,21 @@ def iter_models():
         for m in pr.get("models") or []:
             yield pr, m
 
-def resolve_model(model_name=None):
-    """按模型名（或别名）找到 (提供商, 模型)；找不到返回 (None, None)。"""
+def resolve_model(model_name=None, provider_id=None):
+    """按模型名（或别名）找到 (提供商, 模型)；找不到返回 (None, None)。
+
+    ★ 2026-11-11（问题1）：给了 provider_id 就**只在该提供商内部**查找 ——
+      两家模型名相同时，这是唯一不会串号的解析方式。
+    """
     want = (model_name or "").strip()
+    provs = get_providers()
+    if provider_id:
+        _one = get_provider_by_id(provider_id, provs)
+        if _one is None:
+            return None, None
+        provs = [_one]
     if not want:
         return None, None
-    provs = get_providers()
     # ① 先按模型名精确匹配
     for pr in provs:
         for m in pr.get("models") or []:
@@ -335,12 +455,28 @@ def get_current_model():
     except Exception:
         return ""
 
-def get_api_config(model_name=None):
+def get_api_config(model_name=None, provider_id=None):
     """返回 (api_key, base_url)。
 
     ★ 2026-10-14：支持多提供商 —— 优先按 model_name（或当前请求模型）找到其提供商；
       找不到时回退到老逻辑（settings 的 base_url/api_key），保证兼容。
+    ★ 2026-11-11（问题1）：新增 provider_id —— 给了就**严格**用该提供商，
+      不再有"找不到就退到第一家"的兜底（那正是"选 flash1 扣 flash 钱"的通道）。
     """
+    # ① 明确指定了提供商：只认它，不许回退
+    if provider_id:
+        pr = get_provider_by_id(provider_id)
+        if pr is None:
+            raise ValueError(f"提供商不存在（id={provider_id}），请到「设置 → 模型提供商」重新选择模型")
+        _base = (pr.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+        _key = pr.get("api_key") or ""
+        if not _key:
+            # OpenAI SDK 强制要求 api_key 非空；本地/自建端点（Ollama 等）通常不校验。
+            # 仅对 DeepSeek 官方端点视为"配置缺失"并明确报错，其余给占位符。
+            if (not _base) or ("deepseek.com" in _base.lower()):
+                raise ValueError(f"提供商「{pr.get('name') or provider_id}」尚未配置 API Key")
+            _key = "sk-no-key-required"
+        return _key, _base
     mn = (model_name or "").strip() or get_current_model()
     if mn:
         pr, _m = resolve_model(mn)
@@ -366,43 +502,210 @@ def get_api_config(model_name=None):
     return key, base.rstrip('/')
 
 
-def provider_supports_thinking():
-    """★ 2026-10-10：当前接入的端点是否支持 DeepSeek 专有的思考参数？
+def provider_supports_thinking(provider_id=None):
+    """★ 2026-11-13（用户："默认发思考，对面不接受才不发"）：
 
-    `thinking` / `reasoning_effort` 是 **DeepSeek 专有**的请求字段。
-    以前它们被**无条件**发给所有 OpenAI 兼容端点，于是接别的服务（例如
-    本地 Ollama 跑 qwen2.5）会直接 400：
-        「"qwen2.5:3b" does not support thinking」
+    原来的判定是**白名单**（只给 deepseek.com 发），起因是当年接 Ollama 的 qwen2.5
+    时发 `thinking` 被 400（`does not support thinking`）。但这样做的代价是：
+    任何"后来才支持思考"的端点（七牛 conatus-free、各种 Qwen3 兼容站）永远收不到这个参数，
+    模型根本不会进思考模式 —— 表面看就是"它明明能思考，DeepChat 里却没有思考"。
 
-    判定依据：base_url 指向 deepseek.com，或 api_key 是 DeepSeek 的 sk- 形式。
-    两者都不满足时按"通用 OpenAI 兼容端点"处理 —— 不发专有字段。
+    现在反过来：**默认发**，只有被明确拒绝过才不发。
+      · 被拒一次后记进 `_THINKING_UNSUPPORTED`（按 provider_id 与 base_url 各记一份），
+        之后同一端点不再发，不会再每次多付一次 400 的往返；
+      · 记录只在本进程内存里，重启后重新探一次（配置可能变了）。
+    """
+    for _k in _provider_keys(provider_id):
+        if _k and _k in _THINKING_UNSUPPORTED:
+            return False
+    return True
+
+
+# 已知「不认 thinking 字段」的端点（provider_id / base_url 都会记到这里）
+_THINKING_UNSUPPORTED = set()
+
+
+def _provider_keys(provider_id=None):
+    """用于黑名单匹配的键：provider_id + 归一化的 base_url。"""
+    _keys = [str(provider_id or '')]
+    try:
+        _key, base = get_api_config(provider_id=provider_id)
+        _keys.append((base or '').lower().rstrip('/'))
+    except Exception:
+        pass
+    return _keys
+
+
+def mark_thinking_unsupported(provider_id=None):
+    """记录"这个端点不认 thinking 参数"，后续请求不再发（避免每次多一次 400）。"""
+    for _k in _provider_keys(provider_id):
+        if _k:
+            _THINKING_UNSUPPORTED.add(_k)
+
+
+def provider_is_deepseek(provider_id=None):
+    """是不是 DeepSeek 原生端点 —— 只有它才认 `reasoning_effort` 的 max/high/low 档位。
+
+    七牛等兼容端点虽然也认 thinking，但 `reasoning_effort` 的取值是 high/medium/low，
+    我们这边传的是 `max`，直接发过去有被 400 的风险，所以只对 DeepSeek 发。
     """
     try:
-        _key, base = get_api_config()
-        b = (base or '').lower()
-        if 'deepseek' in b:
-            return True
-        # 非 deepseek 域名但用的是国产 deepseek 转发站（key 为 sk- 且域名含 api）
-        # 一律按不支持处理更安全：多发的字段会让多数端点直接报错。
-        return False
+        _key, base = get_api_config(provider_id=provider_id)
+        return 'deepseek' in (base or '').lower()
     except Exception:
-        return True   # 拿不到配置时维持原行为（DeepSeek 是默认端点）
+        return True
 
-def provider_extra_body(thinking):
-    """需要时才返回 DeepSeek 专有的 extra_body；否则返回 None。"""
-    return {"thinking": {"type": "enabled" if thinking else "disabled"}} \
-        if provider_supports_thinking() else None
 
-def get_client():
-    """按当前设置构造 OpenAI 客户端。
+def _thinking_rejected(err):
+    """这次失败是不是「不认 thinking / reasoning_effort 字段」造成的？
+    用于兜底：带上思考参数被拒时，去掉再试一次（各家兼容层严格程度不一样）。"""
+    try:
+        code = int(getattr(err, 'status_code', 0) or 0)
+    except Exception:
+        code = 0
+    # 认证/额度/找不到/限流/上游故障 —— 与参数字段无关，不降级
+    if code in (401, 402, 403, 404, 429) or code >= 500:
+        return False
+    s = str(err).lower()
+    return any(w in s for w in ('thinking', 'reasoning_effort', 'extra_body',
+                                'budget_tokens', 'budget',
+                                'unknown field', 'unexpected keyword', 'not support',
+                                'unsupported parameter', 'invalid parameter',
+                                'extra fields not permitted'))
 
-    ★ 不能再用模块级单例：base_url / api_key 现在可以在前端修改，
-      必须每次调用时按最新设置构造（OpenAI 客户端构造很轻，开销可忽略）。
+
+def provider_extra_body(thinking, provider_id=None, effort=None):
+    """需要时才返回 `thinking` 参数；否则返回 None。
+
+    ★ 2026-11-13（用户："怎么又没有思考了"）：七牛这类 Anthropic 风格的端点，
+      官方示例是 `"thinking": {"type":"enabled","budget_tokens":160}` ——
+      只给 `type` 有些实现会直接忽略（或按 0 预算处理），表现就是"能思考的模型不思考"。
+      DeepSeek 不认 `budget_tokens`（它只吃 type + reasoning_effort），所以只对非 DeepSeek 补。
     """
-    key, base = get_api_config()
+    if not provider_supports_thinking(provider_id):
+        return None
+    body = {"thinking": {"type": "enabled" if thinking else "disabled"}}
+    if thinking and not provider_is_deepseek(provider_id):
+        body["thinking"]["budget_tokens"] = _THINK_BUDGET.get(str(effort or "").lower(), 1024)
+    return body
+
+
+# 思考预算（非 DeepSeek 端点用）：太小会限制推理，太大会和默认 max_tokens 打架
+_THINK_BUDGET = {"off": 0, "low": 512, "high": 1024, "max": 2048}
+
+def get_client_for_provider(provider_id=None, model_name=None):
+    """**按提供商**构造 OpenAI 客户端（问题1 的核心修复）。
+
+    为什么不能用"模块级单例"或"隐式上下文变量"：
+      · 单例：换提供商 / 改 Key 后不生效；
+      · contextvar：它只在**当前线程**有效，而父循环、子 agent、对话后台生成
+        都是各自 `threading.Thread` 起的 —— 新线程拿到的是默认空值，于是
+        get_current_model() 返回 ""，配置解析退化成"第一家提供商"，
+        扣的就是 Key A 的钱（用户实测：选 flash1 扣 flash）。
+      所以改成**显式传参**：谁调用谁负责把 provider_id 传下来。
+    """
+    key, base = get_api_config(model_name=model_name, provider_id=provider_id)
     if not key:
         raise ValueError("尚未配置 API Key，请在「设置 → 模型与价格」中填写")
     return OpenAI(api_key=key, base_url=base)
+
+def get_client():
+    """兼容旧调用点：按"当前设置"构造客户端。
+
+    ★ 2026-11-11：内部改走 get_client_for_provider()。**新代码不要再调它** ——
+      没有 provider_id 时它只能靠模型名猜提供商，同名模型必然串号。
+    """
+    return get_client_for_provider(None, None)
+
+
+# ★ 2026-11-11（按用户要求）：把上游的原始报错翻译成**人能看懂**的提示。
+#   依据官方文档 https://api-docs.deepseek.com/zh-cn/quick_start/error_codes
+#   原来的界面直接吐 Python 字典：
+#     [生成失败: Error code: 401 - {'error': {'message': 'Authentication Fails,
+#      Your api key: ****0bf0 is invalid (request_id: ...)', 'type': ...}}]
+#   用户根本不知道要改哪里。现在输出「结论 + 该去哪里改」，原始信息只进日志。
+_DEEPSEEK_HTTP_HINTS = {
+    400: ("请求格式错误", "通常是模型名或参数不被该端点接受，请核对「模型名」是否与该提供商匹配。"),
+    401: ("认证失败：API Key 无效", "请到「设置 → 模型提供商」更新该提供商的密钥后重试。"),
+    402: ("余额不足", "该账户余额已用尽，请前往 DeepSeek 控制台充值后重试。"),
+    403: ("无权限", "该密钥无权访问此模型，请确认密钥所属账号与该模型匹配。"),
+    404: ("模型不存在", "该端点没有这个模型名，请核对「模型名」是否填错。"),
+    422: ("参数错误", "该端点不接受本次请求的部分参数（如思考强度、图片输入），可在设置里关闭思考后重试。"),
+    429: ("请求太频繁", "已达到该账号的速率或并发上限，稍等几秒再发，或减少同时运行的子 agent。"),
+    500: ("服务端故障", "上游服务器内部错误，不是你的配置问题，稍后重试即可。"),
+    502: ("网关错误", "上游网关异常；若本机配置了代理，请确认代理可用后重试。"),
+    503: ("服务器繁忙", "上游负载过高，稍后重试即可。"),
+    504: ("网关超时", "上游响应超时，稍后重试即可。"),
+}
+
+
+def humanize_llm_error(err, provider_id=None, model=None):
+    """把 LLM 调用异常转成中文可读提示（结论 + 下一步动作）。"""
+    raw = str(err or "")
+    low = raw.lower()
+    code = None
+    _m = re.search(r"Error code:\s*(\d{3})", raw)
+    if _m:
+        try:
+            code = int(_m.group(1))
+        except Exception:
+            code = None
+
+    # 谁 + 哪个模型，出错时直接告诉用户"是谁的锅"
+    who = ""
+    tail = ""
+    try:
+        pr = get_provider_by_id(provider_id) if provider_id else None
+        if pr:
+            who = f"提供商「{pr.get('name') or provider_id}」"
+            _k = (pr.get("api_key") or "").strip()
+            if len(_k) >= 4:
+                tail = f"（密钥末尾 {_k[-4:]}）"
+        elif model:
+            who = f"模型「{model}」"
+    except Exception:
+        who = ""
+
+    if code in _DEEPSEEK_HTTP_HINTS:
+        head, advice = _DEEPSEEK_HTTP_HINTS[code]
+        if code == 401 and who:
+            return (f"认证失败：API Key 无效（HTTP 401）\n"
+                    f"本次使用的是{who}{tail}，请到「设置 → 模型提供商」更新密钥后重试。")
+        if code == 402 and who:
+            return f"余额不足（HTTP 402）\n{who}的账户余额已用尽，充值后重试。"
+        if code == 429:
+            # ★ 2026-11-13：429 现在是**先自动退避重试**的，走到这里说明重试用完了
+            try:
+                _mr = int(_RETRY_KNOBS.get("max_retries") or 15)
+                _rw = float(_RETRY_KNOBS.get("rate_wait") or 5)
+            except Exception:
+                _mr, _rw = 15, 5.0
+            return (f"请求太频繁（HTTP 429）\n"
+                    f"已自动重试 {_mr} 次（每次间隔约 {_rw:g} 秒）仍被拒绝"
+                    + (f"，本次使用的是{who}{tail}" if who else "") + "。\n"
+                    f"若是「每分钟只能请求一次」这类模型，请到「设置 → 重试与容错」把"
+                    f"「限流等待(毫秒)」调到 60000 以上、并把「重试次数」留足。")
+        if code == 404 and model:
+            return f"模型不存在（HTTP 404）\n该端点没有「{model}」这个模型名，请核对配置。"
+        return f"{head}（HTTP {code}）\n{advice}"
+
+    # —— 非 HTTP 错误：网络类 ——
+    if ("10054" in raw) or ("connection reset" in low) or ("远程主机强迫关闭" in raw) \
+            or ("remoteprotocolerror" in low) or ("peer closed connection" in low):
+        return ("连接被上游中断（WinError 10054 / 连接被重置）\n"
+                "常见于切到后台、代理抖动或上游超时；已自动重试仍失败时，再发一次通常即可恢复。")
+    if ("timeout" in low) or ("timed out" in low) or ("超时" in raw):
+        return "请求超时\n上游长时间没有响应，稍后重试；若频繁出现，检查本机网络或代理设置。"
+    if ("connection error" in low) or ("apiconnectionerror" in low) or ("failed to establish" in low):
+        return ("连不上该端点\n请确认网络可用、Base URL 填写正确；本地模型（Ollama）还要确认服务已启动。")
+    if ("ssl" in low) or ("certificate" in low):
+        return "HTTPS 握手/证书失败\n检查系统时间是否正确，或代理是否在做证书拦截。"
+
+    # —— 兜底：只给一句人话 + HTTP 码，不吐原始字典 ——
+    if code:
+        return f"调用模型失败（HTTP {code}）\n上游返回了未识别的错误，详情见 server/logs/server.log。"
+    _short = raw.strip().splitlines()[0][:120] if raw.strip() else "未知错误"
+    return f"调用模型失败：{_short}\n详情见 server/logs/server.log。"
 
 def mask_api_key(key):
     """★ 前端展示用的脱敏值：只暴露末 4 位（key 本身绝不返回给前端）。"""
@@ -572,6 +875,7 @@ You are DeepSeek, an AI assistant created by DeepSeek. Your knowledge cutoff is 
 
 ## Output Standards
 - Use Markdown to improve readability.
+- Draw structured content (flowcharts, sequence diagrams, architecture, state machines, ER diagrams, Gantt charts, mind maps) as a ```mermaid code block — it renders with copy and download buttons. ER relationship labels must be double-quoted.
 - Wrap LaTeX math in $...$ or $$...$$; do not use \\(...\\) or \\[...\\].
 - **Bold formatting**: when using `**text**`, make sure the first and last characters inside the `**` are **not punctuation**.
 
@@ -579,28 +883,81 @@ You are DeepSeek, an AI assistant created by DeepSeek. Your knowledge cutoff is 
 - Default to Simplified Chinese; be friendly and professional.
 """
 
-def _effective_chat_system():
-    """对话模式系统提示词（★ 与操作模式完全独立）。
+def _prompt_state():
+    """读取提示词设置的三件套：覆盖文本 / 关闭的段落 / 关闭的基础提示词。
 
-    优先级：prompts.chat_base（用户在“提示词”标签页里为对话模式单独保存的覆盖）
-            → 内置 SYSTEM_PROMPT。
-    注意：**不再**读取操作模式的 agent_base / 旧的 base —— 那是操作模式的 operator 提示词，
-    混用会让对话模式变成“能执行系统命令的操作助手”，与旧版行为不符。
+    ★ 2026-11-12（用户需求：接 Ollama 小模型，上下文短、首包慢，必须能删提示词）：
+        prompts.sections[key] = 该段的文本覆盖（旧行为，保留）
+        prompts.off = [key, ...]       显式**关闭**的段落（优先级高于文本覆盖）
+        prompts.base_off = [key, ...]  显式**关闭**的基础提示词
+                                       （chat_base / agent_base / child_base）
+    没有这三件套之前：清空文本框只会回退到内置默认，"删掉"是做不到的。
     """
     try:
-        _p = (load_server_settings().get("prompts") or {}).get("chat_base") or ""
+        p = load_server_settings().get("prompts") or {}
     except Exception:
-        _p = ""
-    return _p.strip() or SYSTEM_PROMPT
+        p = {}
+    secs = p.get("sections") if isinstance(p.get("sections"), dict) else {}
+    off = set(x for x in (p.get("off") or []) if isinstance(x, str))
+    base_off = set(x for x in (p.get("base_off") or []) if isinstance(x, str))
+    return p, secs, off, base_off
+
+
+def _sec_text(key, default, secs, off):
+    """该段落应拼进来的文本。返回 None 表示"用户关掉了这一段"（≠ 空字符串）。"""
+    if key in off:
+        return None
+    v = secs.get(key)
+    if isinstance(v, str) and v.strip():
+        return v
+    return default
+
+
+def _base_text(p, key, default, base_off):
+    """基础提示词文本。关闭时返回 ''（此时最终 system 可能为空，调用方需跳过该消息）。"""
+    if key in base_off:
+        return ""
+    return (str(p.get(key) or "")).strip() or default
+
+
+def _chat_system_parts():
+    """对话模式系统提示词的分段明细 [(key, text, source)]，source ∈ default/override/off。
+
+    ★ 与 _effective_chat_system 共用，保证「预览」和「实际发出」永远一致。
+    ★ 2026-11-12（用户要求）：Mermaid 说明已并进基础提示词的 Output Standards，
+      是一句话，不再作为独立段落单独拼接 —— 少一个选项，也少一截上下文。
+    """
+    p, _secs, _off, base_off = _prompt_state()
+    base = _base_text(p, "chat_base", SYSTEM_PROMPT, base_off)
+    _ov = (str(p.get("chat_base") or "")).strip()
+    return [("chat_base", base, "off" if not base else ("override" if _ov else "default"))]
+
+
+def _effective_chat_system():
+    """对话模式最终系统提示词。返回 '' 表示不发 system 消息（全部关掉时）。"""
+    return "\n\n".join(t for _, t, _ in _chat_system_parts() if (t or "").strip())
 
 
 def _effective_child_base():
-    """子 Agent 基础提示词：prompts.child_base 覆盖优先，否则内置 CHILD_SYSTEM_PROMPT。"""
-    try:
-        _p = (load_server_settings().get("prompts") or {}).get("child_base") or ""
-    except Exception:
-        _p = ""
-    return _p.strip() or CHILD_SYSTEM_PROMPT
+    """子 Agent 基础提示词：prompts.child_base 覆盖优先，否则内置；可被 base_off 关闭。"""
+    p, _secs, _off, base_off = _prompt_state()
+    return _base_text(p, "child_base", CHILD_SYSTEM_PROMPT, base_off)
+
+
+def _sys_message(content):
+    """把文本包成一条 system 消息；文本为空时返回 None，调用方需过滤掉。
+
+    ★ 2026-11-12：用户可能把提示词全部关掉（接 Ollama 短上下文 / 首包慢），
+      这时不能再塞一条空的 system 消息。
+    """
+    c = (content or "").strip()
+    return {"role": "system", "content": c} if c else None
+
+
+def _with_system(content, rest):
+    """把 system 消息（可为 None）放到最前面，空则只返回 rest。"""
+    m = _sys_message(content)
+    return ([m] if m else []) + list(rest)
 
 WORK_DIR = os.environ.get("WORK_DIR_OVERRIDE") or os.path.join(BASE_DIR, 'workspace')
 UPLOAD_FOLDER = os.path.join(WORK_DIR, 'uploads')
@@ -1159,20 +1516,37 @@ class TreeManager:
             except: self.tree = {"root": None, "nodes": {}}
 
     def _flush(self):
+        """把整棵树落到 chat_tree.json。
+
+        ★ 2026-11-11（问题3 的真正大头）：原来**序列化和 12MB 磁盘写都在锁内**，
+          而 update_node 用的是同一把锁 —— 于是每 2 秒就有一次长时间阻塞，
+          正在流式输出的那条线程被迫等在锁上，tok/s 直接塌到 1/8。
+          实测：这个用户的 chat_tree.json 已经 17MB / 608 个节点，
+          一次 json.dump(indent=2) 0.33s + 写 12.5MB。
+          现在：锁内只做内存序列化（快、可控），磁盘写在**锁外**做；
+          落盘间隔放宽到 4 秒，用紧凑格式（体积也小一点）。
+        """
         with self.lock:
             if not self.dirty: return
-            tmp = self.filepath + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f: json.dump(self.tree, f, indent=2, ensure_ascii=False)
-            if os.name == 'nt':
-                if os.path.exists(self.filepath): os.remove(self.filepath)
-                os.rename(tmp, self.filepath)
-            else: os.replace(tmp, self.filepath)
+            payload = json.dumps(self.tree, ensure_ascii=False, separators=(',', ':'))
             self.dirty = False
+        tmp = self.filepath + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(payload)
+            os.replace(tmp, self.filepath)     # Windows 上同样可原子替换
+        except Exception as e:
+            with self.lock:
+                self.dirty = True              # 写失败：下次重试，别丢数据
+            try:
+                logging.warning(f'[TREE] 落盘失败: {e}')
+            except Exception:
+                pass
 
     def _start_flush(self):
         def loop():
             while True:
-                time.sleep(2)
+                time.sleep(4)
                 self._flush()
         threading.Thread(target=loop, daemon=True).start()
 
@@ -1191,7 +1565,41 @@ class TreeManager:
         threading.Thread(target=loop, daemon=True).start()
 
     def get(self):
-        with self.lock: return json.loads(json.dumps(self.tree))
+        """整棵树快照。
+
+        ★ 2026-11-11：原来是 json.loads(json.dumps(tree))，17MB 的树要 0.26s，
+          而且每次 /api/tree、/api/node 都来一次 —— 多台客户机一起轮询时
+          GIL 直接被这些"复制"占满（这就是"客户机一多就越跑越慢"的元凶）。
+          deepcopy 只复制容器，字符串是共享的，快 16 倍（实测 0.016s）。
+        """
+        with self.lock:
+            return copy.deepcopy(self.tree)
+
+    def get_node(self, nid):
+        """单个节点快照：20 微秒级，/api/node 专用。"""
+        with self.lock:
+            n = self.tree["nodes"].get(nid)
+            return copy.deepcopy(n) if n is not None else None
+
+    def get_slim(self):
+        """/api/tree 专用的轻量视图（只含树状列表需要的字段）。
+
+        关键点：**不复制整棵树**，直接在锁内挑字段现拼 —— 避免为了拿 7 个字段
+        而深拷贝 12MB 的正文内容。
+        """
+        with self.lock:
+            slim_nodes = {}
+            for nid, node in self.tree["nodes"].items():
+                slim_nodes[nid] = {
+                    "id": node.get("id", nid),
+                    "parentId": node.get("parentId"),
+                    "title": node.get("title"),
+                    "generating": node.get("generating", False),
+                    "children": list(node.get("children") or []),
+                    "createdAt": node.get("createdAt"),
+                    "last_update": node.get("last_update"),
+                }
+            return {"root": self.tree["root"], "nodes": slim_nodes}
 
     def create_node(self, pid, sid, umsg, amsg, title, reasoning="", model=None, reasoningEffort=None, gen=False):
         with self.lock:
@@ -1229,7 +1637,14 @@ class TreeManager:
                     if k in ('assistantMessage','reasoning','title','model',
                              'usage','reasoningDuration','reasoningEffort',
                              'generating','images','stopReason','finishReason',
-                             'thinkingEnabled','files'):
+                             'thinkingEnabled','files',
+                             # ★ 2026-11-13：对话模式的重试提示（{reason,wait,attempt,max,ts}），
+                             #   前端渲染成独立胶囊，不污染回答正文。
+                             'retryTip',
+                             # ★ 2026-11-11：记录"这条回复是哪个提供商出的"。
+                             #   两家提供商的模型名可能完全相同（都叫 deepseek-v4-flash），
+                             #   只靠模型名根本分不出 flash 和 flash1，界面标签就会张冠李戴。
+                             'providerId'):
                         node[k] = v
                 # ★ 用量计价以调用时间为准：写入 usage 时同时记录调用时间戳（峰谷定价）
                 if kw.get('usage') is not None:
@@ -1239,7 +1654,46 @@ class TreeManager:
                 return True
             return False
 
+    def backup(self, reason='manual'):
+        # 60 秒内只留一份：批量删除时不会一次写出十几个 17MB 的快照
+        """把当前整棵树快照到 logs/tree_backup/。
+
+        ★ 2026-11-11（事故教训）：之前删节点是**不可恢复**的 —— 内存里删掉，
+        4 秒后整树落盘覆盖，没有任何历史版本（这台机器也没有卷影副本）。
+        现在任何破坏性操作（删节点 / 整树覆盖）之前都先留一份快照，保留最近 10 份。
+        备份失败不影响主操作，只在日志里警告。
+        """
+        try:
+            with self.lock:
+                last = getattr(self, '_last_backup_ts', 0)
+            if reason == 'before_delete' and time.time() - last < 60:
+                return None          # 一分钟内已有快照，够用了
+            d = os.path.join(os.path.dirname(self.filepath), 'logs', 'tree_backup')
+            os.makedirs(d, exist_ok=True)
+            ts = time.strftime('%Y%m%d_%H%M%S')
+            self._last_backup_ts = time.time()
+            fn = os.path.join(d, f'{ts}_{reason}.json')
+            with self.lock:
+                payload = json.dumps(self.tree, ensure_ascii=False)
+            with open(fn, 'w', encoding='utf-8') as f:
+                f.write(payload)
+            files = sorted(x for x in os.listdir(d) if x.endswith('.json'))
+            for old in files[:-10]:   # 每份 ~17MB，最多留 10 份
+                try:
+                    os.remove(os.path.join(d, old))
+                except Exception:
+                    pass
+            return fn
+        except Exception as e:
+            try:
+                logging.warning(f'[TREE] 备份失败: {e}')
+            except Exception:
+                pass
+            return None
+
     def delete_node(self, nid):
+        # ★ 删之前先备份（见 backup 的说明）
+        self.backup('before_delete')
         with self.lock:
             if nid not in self.tree["nodes"]: return False
             def rec(x):
@@ -1849,17 +2303,80 @@ def _deepseek_key_is_placeholder(providers=None):
 #   服务端把**发出的每个 thinking 块**原样记一份，供与前端渲染结果对照，
 #   定位"生成已结束后前端仍显示不完整"到底丢在哪一环。
 THINKING_DUMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs', 'thinking_dump')
+# ★ 2026-11-11（问题3：性能）：这个落盘原来是**每个思考 chunk 同步 open/write/close**，
+#   还持一把全局锁。实测一条长回复有上千个 chunk，等于上千次磁盘 IO + 上千次锁争用，
+#   而且全部发生在 LLM 读取线程上 —— 越慢的盘越卡，多会话并发时互相排队，
+#   表现为"操作模式 tok/s 只有直连 API 的四分之一，机器越差越明显"。
+#   现在改为**完全异步 + 批量写**：
+#     · 调用方只做一次 dict 查改 + 一次 put_nowait（微秒级，绝不碰磁盘）；
+#     · 后台单线程按 0.5s 一批合并写，每批每文件只 open/写/close 一次；
+#     · 队列满时**直接丢弃**（调试日志丢了不影响功能，绝不能反压 LLM 流）。
+#   想彻底关掉：环境变量 DEEPCHAT_THINK_DUMP=0。
+THINKING_DUMP_ENABLED = str(os.environ.get('DEEPCHAT_THINK_DUMP', '1')).strip().lower() not in ('0', 'false', 'off', 'no')
 _thinking_dump_lock = threading.Lock()
 _thinking_dump_state = {}     # {session_id: (path, block_no, chars)}
+_thinking_dump_q = queue.Queue(maxsize=8000)
+_thinking_dump_worker_started = False
+_thinking_dump_dropped = 0
+
+
+def _thinking_dump_worker():
+    """后台写盘线程：批量、非阻塞、空闲即关闭句柄。"""
+    handles = {}          # {path: file object}
+    while True:
+        try:
+            first = _thinking_dump_q.get(timeout=0.5)
+        except queue.Empty:
+            # 空闲：把句柄关掉，免得N 个会话挂 N 个 fd
+            for _p, _f in list(handles.items()):
+                try:
+                    _f.close()
+                except Exception:
+                    pass
+            handles.clear()
+            continue
+        batch = [first]
+        try:
+            while len(batch) < 4000:
+                batch.append(_thinking_dump_q.get_nowait())
+        except queue.Empty:
+            pass
+        grouped = {}
+        for _path, _line in batch:
+            grouped.setdefault(_path, []).append(_line)
+        for _path, _lines in grouped.items():
+            f = handles.get(_path)
+            if f is None:
+                try:
+                    os.makedirs(THINKING_DUMP_DIR, exist_ok=True)
+                    f = open(_path, 'a', encoding='utf-8')
+                    handles[_path] = f
+                except Exception as _e:
+                    try:
+                        logging.warning(f'[THINK_DUMP] 打开失败 {_path}: {_e}')
+                    except Exception:
+                        pass
+                    continue
+            try:
+                f.writelines(_lines)
+                f.flush()
+            except Exception:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                handles.pop(_path, None)
 
 
 def thinking_dump_write(session_id, kind, text, extra=None):
-    """把一条 thinking 相关记录追加到 logs/thinking_dump/<session>.jsonl。
+    """把一条 thinking 相关记录放进写盘队列（**不做任何磁盘 IO**）。
 
     kind: 'chunk'（本次新增的思考片段）/ 'done'（该轮思考结束）/ 'final'（完整思考）
     """
+    global _thinking_dump_dropped, _thinking_dump_worker_started
+    if not THINKING_DUMP_ENABLED:
+        return None
     try:
-        os.makedirs(THINKING_DUMP_DIR, exist_ok=True)
         sid = str(session_id or 'nosession')
         with _thinking_dump_lock:
             path, blk, chars = _thinking_dump_state.get(sid, (None, 0, 0))
@@ -1881,13 +2398,20 @@ def thinking_dump_write(session_id, kind, text, extra=None):
                 rec.update(extra)
             if text is not None:
                 rec['text'] = text
-            with open(path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
             _thinking_dump_state[sid] = (path, blk, chars)
-            return path
+            line = json.dumps(rec, ensure_ascii=False) + '\n'
+        if not _thinking_dump_worker_started:
+            threading.Thread(target=_thinking_dump_worker, daemon=True,
+                             name='thinking-dump-writer').start()
+            _thinking_dump_worker_started = True
+        try:
+            _thinking_dump_q.put_nowait((path, line))
+        except queue.Full:
+            _thinking_dump_dropped += 1
+        return path
     except Exception as e:
         try:
-            logging.warning(f'[THINK_DUMP] 写入失败: {e}')
+            logging.warning(f'[THINK_DUMP] 入队失败: {e}')
         except Exception:
             pass
         return None
@@ -1926,12 +2450,23 @@ def _mask_settings_for_client(st):
         _provs = out.get('providers')
         if isinstance(_provs, list):
             safe = []
-            for pr in _provs:
-                sp = dict(pr or {})
+            for _i, pr in enumerate(_provs):
+                # ★ 问题1/问题2：**补上稳定 id** —— 老配置文件里没有 id 字段，
+                #   前端要拿它当请求参数与 DOM 键，缺了就会退回"按模型名猜"的老路。
+                sp = _norm_provider(pr, _i)
                 rk = (sp.get('api_key') or '').strip()
                 sp['api_key'] = mask_api_key(rk)
                 sp['has_api_key'] = bool(rk)
                 safe.append(sp)
+            # 与 get_providers() 同样的去重规则，保证前后端看到的 id 一致
+            _seen = {}
+            for sp in safe:
+                _id = sp["id"]
+                if _id in _seen:
+                    _seen[_id] += 1
+                    sp["id"] = f"{_id}_{_seen[_id]}"
+                else:
+                    _seen[_id] = 1
             out['providers'] = safe
     except Exception:
         pass
@@ -1952,8 +2487,83 @@ def get_server_settings():
 #   ★ key 只在服务端使用，绝不返回给前端；前端只拿余额数字。
 # ★ 2026-10-14（按用户要求）：余额**按提供商**查询 —— 缓存也按 base_url 分开，
 #   不同提供商的余额互不干扰。key 仍然只在服务端使用。
-_BALANCE_CACHE = {}          # {base_url: {"at": ts, "data": {...}}}
+# ★ BUGFIX(2026-11-11, 问题2「余额互相覆盖」)：
+#   缓存键原来只有 base_url —— 用户的两家提供商都用 api.deepseek.com，
+#   于是第一家的结果被写进缓存后，第二家直接命中缓存，两张卡片显示同一个金额
+#   （证据 2（自动获取）.png：两家都是 ¥71.04）。点"刷新"带 force=1 绕过缓存
+#   才分别拿到 70.78 / 8.79 —— 这就是"刷新后才正常"的原因。
+#   现在键 = base_url + **Key 指纹**：同一域名不同 Key 各有各的缓存。
+_BALANCE_CACHE = {}          # {cache_key: {"at": ts, "data": {...}}}
 _BALANCE_TTL = 60
+
+
+def _balance_cache_key(base_url, api_key):
+    """余额缓存键：域名 + Key 指纹（不可逆，不泄露 Key）。"""
+    _fp = hashlib.sha1((api_key or "").encode("utf-8")).hexdigest()[:10]
+    return f"{(base_url or '').rstrip('/')}|{_fp}"
+
+
+def _query_zhipu_balance(base, key, _proxies=None):
+    """★ 2026-11-13（用户问「ZP 和 Tencent 有没有查余额的接口」）：
+    智谱（BigModel）确实有，只是没写进 API 参考文档：
+      · 优先 https://open.bigmodel.cn/api/biz/account/query-customer-account-report
+        （控制台财务页在用，实测 200：balance / rechargeAmount / giveAmount / totalSpendAmount）
+      · 退路 {base}/users/me/balance（旧版资源接口，部分账号 404）
+    返回统一结构（字段名与前端的 total_balance/granted_balance/topped_up_balance 对齐）。
+    """
+    _hdr = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    _host = re.sub(r'^https?://', '', (base or '')).split('/')[0].lower()
+    _root = ('https://' + _host) if _host else 'https://open.bigmodel.cn'
+    for _u, _kind in ((_root + '/api/biz/account/query-customer-account-report', 'report'),
+                      (base.rstrip('/') + '/users/me/balance', 'legacy')):
+        try:
+            r = requests.get(_u, headers=_hdr, timeout=12, proxies=_proxies)
+        except Exception:
+            continue
+        if r.status_code in (401, 403):
+            return {"success": False, "error": f"API Key 无效或无权限（HTTP {r.status_code}）"}
+        if r.status_code != 200:
+            continue
+        try:
+            j = r.json() or {}
+        except Exception:
+            continue
+        if _kind == 'report':
+            _d = j.get('data') or {}
+            if not isinstance(_d, dict) or ('balance' not in _d and 'availableBalance' not in _d):
+                continue
+            _bal = _d.get('availableBalance')
+            if _bal is None:
+                _bal = _d.get('balance')
+            _recharge = _d.get('rechargeAmount')
+            _gift = _d.get('giveAmount')
+            return {
+                "success": True,
+                "is_available": float(_bal or 0) > 0,
+                "currency": "CNY",
+                "total_balance": f"{float(_bal or 0):.2f}",
+                "granted_balance": f"{float(_gift or 0):.2f}",
+                "topped_up_balance": f"{float(_recharge or 0):.2f}",
+                "spent_balance": (f"{float(_d.get('totalSpendAmount')):.2f}"
+                                  if _d.get('totalSpendAmount') is not None else ""),
+                "balance_infos": [],
+                "note": "智谱余额（含充值/赠金拆分）",
+            }
+        _bi = j.get('balanceInfo') or j.get('data') or {}
+        if not isinstance(_bi, dict) or 'balance' not in _bi:
+            continue
+        _bal = float(_bi.get('balance') or 0)
+        return {
+            "success": True,
+            "is_available": _bal > 0,
+            "currency": "CNY",
+            "total_balance": f"{_bal:.2f}",
+            "granted_balance": f"{float(_bi.get('giftBalance') or 0):.2f}",
+            "topped_up_balance": "",
+            "balance_infos": [],
+            "note": "智谱余额",
+        }
+    return None          # 两个端点都没给出可用结果 → 交给调用方按"不支持"处理
 
 
 @app.route('/api/api_balance', methods=['GET'])
@@ -1962,7 +2572,8 @@ def api_balance():
 
     ★ 2026-10-14：支持 ?provider=<序号> —— 用**该提供商自己的** base_url / api_key 去查，
       这样"模型提供商"里每张卡片都能显示自己的余额（用户要求"按照 base_url 来查"）。
-      不传 provider 时保持原行为（用全局配置），兼容旧调用。
+    ★ 2026-11-11（问题2）：?provider= 现在同时接受 **稳定 id / 名称 / 序号**，
+      前端传 id（下标会随增删卡片平移，不能当身份用）。
     """
     force = (request.args.get('force') or '') in ('1', 'true', 'yes')
     # —— 解析要查哪家 ——
@@ -1970,61 +2581,162 @@ def api_balance():
     _pv_name = ''
     try:
         if _pv_idx is not None and str(_pv_idx) != '':
-            _provs = get_providers()
-            _i = int(_pv_idx)
-            if 0 <= _i < len(_provs):
-                _pr = _provs[_i]
-                key = (_pr.get('api_key') or '').strip()
-                base = (_pr.get('base_url') or '').strip() or DEFAULT_BASE_URL
-                _pv_name = _pr.get('name') or ''
-            else:
-                return jsonify({"success": False, "error": f"提供商序号越界: {_pv_idx}"})
+            _pr = get_provider_by_id(_pv_idx)
+            if _pr is None:
+                return jsonify({"success": False, "error": f"提供商不存在: {_pv_idx}"})
+            _pv_name = _pr.get('name') or ''
+            # ★ 走统一的凭据解析：本地端点（Ollama）会拿到占位 key，
+            #   DeepSeek 端点缺 key 会抛出可读错误（不再静默用别家的 key）。
+            try:
+                key, base = get_api_config(provider_id=_pr.get('id') or _pv_idx)
+            except ValueError as _ve:
+                return jsonify({"success": False, "provider": _pv_name, "error": str(_ve)})
         else:
             key, base = get_api_config()
     except Exception as e:
         return jsonify({"success": False, "error": f"读取配置失败: {e}"})
     base = (base or DEFAULT_BASE_URL).rstrip('/')
     now = time.time()
-    _c = _BALANCE_CACHE.get(base)
+    _ck = _balance_cache_key(base, key)
+    _c = _BALANCE_CACHE.get(_ck)
     if (not force) and _c and _c.get("data") is not None and (now - _c["at"] < _BALANCE_TTL):
         return jsonify(_c["data"])
     if not key:
         return jsonify({"success": False, "provider": _pv_name,
                         "error": "该提供商尚未配置 API Key"})
-    url = base + '/user/balance'
-    try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
-                         timeout=12)
-        if r.status_code == 404:
-            # 多数第三方 OpenAI 兼容端点没有这个接口 —— 明确说明，不当成错误
-            out = {"success": False, "unsupported": True,
-                   "error": "当前 Base URL 不支持余额查询（该接口是 DeepSeek 专有）"}
-        elif r.status_code in (401, 403):
-            out = {"success": False, "error": f"API Key 无效或无权限（HTTP {r.status_code}）"}
-        elif r.status_code != 200:
-            out = {"success": False, "error": f"查询失败（HTTP {r.status_code}）：{r.text[:160]}"}
-        else:
-            d = r.json() if r.content else {}
-            infos = d.get("balance_infos") or []
-            out = {
-                "success": True,
-                "is_available": bool(d.get("is_available")),
-                "currency": (infos[0].get("currency") if infos else "") or "",
-                "total_balance": (infos[0].get("total_balance") if infos else "") or "",
-                "granted_balance": (infos[0].get("granted_balance") if infos else "") or "",
-                "topped_up_balance": (infos[0].get("topped_up_balance") if infos else "") or "",
-                "balance_infos": infos,
-            }
-    except requests.exceptions.Timeout:
-        out = {"success": False, "error": "查询超时（网络或上游无响应）"}
-    except Exception as e:
-        out = {"success": False, "error": f"查询异常: {type(e).__name__}: {e}"}
+    # ★ 2026-11-11（问题2 附带修复）：本机端点（Ollama 等）绝不能走系统代理。
+    #   这台机器设了 HTTP_PROXY，requests 默认信任环境变量，于是
+    #   http://127.0.0.1:11434/user/balance 被丢给代理 → 502
+    #   「upstream connect failed: 由于目标计算机积极拒绝」。
+    _loopback = bool(re.match(r'^https?://(127\.0\.0\.1|localhost|\[::1\])(:|\/)', base, re.I))
+    _proxies = {'http': None, 'https': None} if _loopback else None
+    # ★ 2026-11-13：智谱（BigModel）走自己的财务接口 —— /user/balance 是 DeepSeek 专有的，
+    #   直接打过去只会 404，白白显示“不支持查询”。
+    _host_l = re.sub(r'^https?://', '', base).split('/')[0].lower()
+    _is_zhipu = ('bigmodel.cn' in _host_l) or _host_l == 'z.ai' or _host_l.endswith('.z.ai')
+    if _is_zhipu:
+        _zp_out = _query_zhipu_balance(base, key, _proxies)
+        out = _zp_out or {"success": False, "unsupported": True,
+                          "error": "智谱余额接口无响应（该 Key 可能是 Coding Plan，余额不适用）"}
+    else:
+        url = base + '/user/balance'
+        try:
+            r = requests.get(url, headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+                             timeout=12, proxies=_proxies)
+            if r.status_code == 404:
+                # 多数第三方 OpenAI 兼容端点没有这个接口 —— 明确说明，不当成错误
+                out = {"success": False, "unsupported": True,
+                       "error": "当前 Base URL 不支持余额查询（/user/balance 是 DeepSeek 专有接口）"}
+            elif r.status_code in (401, 403):
+                out = {"success": False, "error": f"API Key 无效或无权限（HTTP {r.status_code}）"}
+            elif r.status_code != 200:
+                out = {"success": False, "error": f"查询失败（HTTP {r.status_code}）：{r.text[:160]}"}
+            else:
+                d = r.json() if r.content else {}
+                infos = d.get("balance_infos") or []
+                out = {
+                    "success": True,
+                    "is_available": bool(d.get("is_available")),
+                    "currency": (infos[0].get("currency") if infos else "") or "",
+                    "total_balance": (infos[0].get("total_balance") if infos else "") or "",
+                    "granted_balance": (infos[0].get("granted_balance") if infos else "") or "",
+                    "topped_up_balance": (infos[0].get("topped_up_balance") if infos else "") or "",
+                    "balance_infos": infos,
+                }
+        except requests.exceptions.Timeout:
+            out = {"success": False, "error": "查询超时（网络或上游无响应）"}
+        except requests.exceptions.ConnectionError:
+            # 本地端点最常见的情况：Ollama 没开 / 端口不对
+            out = {"success": False, "error": f"无法连接该端点（{base}），服务可能没启动"}
+        except Exception as e:
+            out = {"success": False, "error": f"查询异常: {type(e).__name__}: {e}"}
     # 把查询对象也带回给前端（便于卡片显示"查的是谁"），但不含 key
     out["provider"] = _pv_name
+    out["provider_id"] = (get_provider_by_id(_pv_idx).get("id") if _pv_idx else "") or ""
     out["base_url"] = base
     if out.get("success"):
-        _BALANCE_CACHE[base] = {"at": now, "data": out}
+        _BALANCE_CACHE[_ck] = {"at": now, "data": out}
     return jsonify(out)
+
+
+@app.route('/api/provider_test', methods=['POST'])
+def provider_test():
+    """★ 2026-11-13（用户要求「想知道到底是 key 无效还是地址不对」）：
+    用**该提供商自己的** base_url / api_key 发一个 max_tokens=1 的请求，
+    把上游的原始错误原样带回来。
+
+    余额接口（/user/balance）是 DeepSeek 专有的，第三方（智谱、混元、Ollama…）
+    一律 404，所以"查余额失败"根本不能说明 key 有没有问题 —— 必须有这个。
+    """
+    d = request.get_json(silent=True) or {}
+    _pid = d.get('provider') or d.get('id') or ''
+    pr = get_provider_by_id(_pid)
+    if pr is None:
+        return jsonify({"success": False, "error": f"提供商不存在: {_pid}"}), 404
+    _name = pr.get('name') or _pid
+    try:
+        key, base = get_api_config(provider_id=pr.get('id') or _pid)
+    except Exception as e:
+        return jsonify({"success": False, "provider": _name, "error": str(e)[:300]})
+    model = ''
+    for m in (pr.get('models') or []):
+        if (m.get('name') or '').strip():
+            model = m['name'].strip()
+            break
+    if not model:
+        return jsonify({"success": False, "provider": _name, "error": "该提供商下没有填任何模型名"})
+    base = (base or '').rstrip('/')
+    if not base:
+        return jsonify({"success": False, "provider": _name, "error": "该提供商没有填 Base URL"})
+    _loopback = bool(re.match(r'^https?://(127\.0\.0\.1|localhost|\[::1\])(:|\/)', base, re.I))
+    _proxies = {'http': None, 'https': None} if _loopback else None
+    _t0 = time.time()
+    try:
+        r = requests.post(base + '/chat/completions',
+                          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                          json={"model": model, "messages": [{"role": "user", "content": "ping"}],
+                                "max_tokens": 1, "stream": False},
+                          timeout=25, proxies=_proxies)
+        _ms = int((time.time() - _t0) * 1000)
+        if r.status_code == 200:
+            return jsonify({"success": True, "provider": _name, "provider_id": pr.get('id'),
+                            "model": model, "base_url": base, "latency_ms": _ms,
+                            "key_len": len(key or ''), "key_tail": (key or '')[-4:]})
+        _txt = ''
+        try:
+            _txt = r.text[:400]
+        except Exception:
+            pass
+        _hint = ''
+        if r.status_code in (401, 403):
+            _hint = '（Key 无效 / 已过期 / 无权访问该模型）'
+            # ★ 2026-11-13（实测踩到）：腾讯云 `sk-tp-` 开头的是 **Token Plan（TokenHub）**
+            #   套餐密钥，只能走 https://tokenhub.tencentmaas.com/plan/v3，
+            #   拿它去调 api.hunyuan.cloud.tencent.com/v1 一定是
+            #   「Incorrect API key provided」—— 看着像 Key 错了，其实是地址错。
+            _k = (key or '')
+            if _k.startswith('sk-tp-') and 'tokenhub.tencentmaas.com' not in base:
+                _hint = ('（这把 sk-tp- 开头的是腾讯云 Token Plan / TokenHub 的套餐密钥，'
+                         'Base URL 要填 https://tokenhub.tencentmaas.com/plan/v3，'
+                         '不适用于 api.hunyuan.cloud.tencent.com/v1）')
+        elif r.status_code == 404:
+            _hint = '（地址或模型名不对：确认 Base URL 到 /v1 为止，且模型名在控制台存在）'
+        elif r.status_code == 400:
+            _hint = '（请求参数或模型名不被接受）'
+        return jsonify({"success": False, "provider": _name, "provider_id": pr.get('id'),
+                        "model": model, "base_url": base, "latency_ms": _ms,
+                        "http_status": r.status_code, "hint": _hint,
+                        "key_len": len(key or ''), "key_tail": (key or '')[-4:],
+                        "error": f"HTTP {r.status_code}{_hint}：{_txt}"})
+    except requests.exceptions.Timeout:
+        return jsonify({"success": False, "provider": _name, "model": model, "base_url": base,
+                        "error": "请求超时（25s）：地址不通 / 需要代理 / 上游无响应"})
+    except requests.exceptions.ConnectionError as e:
+        return jsonify({"success": False, "provider": _name, "model": model, "base_url": base,
+                        "error": f"连不上 {base}：{str(e)[:200]}"})
+    except Exception as e:
+        return jsonify({"success": False, "provider": _name, "model": model, "base_url": base,
+                        "error": f"测试异常: {type(e).__name__}: {str(e)[:200]}"})
 
 
 @app.route('/api/server_settings', methods=['POST'])
@@ -2084,6 +2796,11 @@ def post_server_settings():
             if sec is not None and (not isinstance(sec, dict) or any(
                     (not isinstance(k, str)) or (not isinstance(v, str)) for k, v in sec.items())):
                 errors.append("prompts.sections 必须为“字符串→字符串”对象")
+            # ★ 2026-11-12：显式关闭的段落 / 基础提示词（接 Ollama 短上下文时用来删提示词）
+            for _k in ("off", "base_off"):
+                _v = prompts.get(_k)
+                if _v is not None and (not isinstance(_v, list) or any(not isinstance(x, str) for x in _v)):
+                    errors.append(f"prompts.{_k} 必须为字符串数组")
     if errors:
         return jsonify({"success": False, "error": "；".join(errors)}), 400
     try:
@@ -2097,31 +2814,51 @@ def post_server_settings():
     safe['has_api_key'] = bool(_rk)
     return jsonify({"success": True, "settings": _mask_settings_for_client(safe)})
 
+@app.route('/api/prompt_preview', methods=['GET'])
+def prompt_preview():
+    """预览「最终真正发给模型的系统提示词」。
+
+    ★ 2026-11-12（用户需求）：接 Ollama 这类上下文短、首包慢的本地模型时要能删提示词，
+      所以必须能看见最终拼装结果。这里与运行时**共用同一批拼装函数**
+      （_chat_system_parts / _agent_system_parts / _effective_child_base），
+      预览和实发不会有第二套逻辑。
+
+    ?mode=chat|agent|child（默认 chat）
+    返回 {success, mode, total_chars, text, parts:[{key, source, chars, text}]}
+      source: default=内置默认 / override=用户改过 / off=已关闭（不拼）
+    """
+    mode = (request.args.get("mode") or "chat").strip().lower()
+    if mode == "agent":
+        parts = _agent_system_parts(load_server_settings())
+    elif mode == "child":
+        p, _s, _o, _base_off = _prompt_state()
+        _txt = _effective_child_base()
+        if not _txt:
+            _src = "off"
+        elif (str(p.get("child_base") or "")).strip():
+            _src = "override"
+        else:
+            _src = "default"
+        parts = [("child_base", _txt, _src)]
+    elif mode == "chat":
+        parts = _chat_system_parts()
+    else:
+        return jsonify({"success": False, "error": "mode 只能是 chat / agent / child"}), 400
+    text = "\n\n".join(t for _k, t, _s in parts if (t or "").strip())
+    out = [{"key": k, "source": s, "chars": len(t or ""), "text": t or ""} for k, t, s in parts]
+    return jsonify({"success": True, "mode": mode, "total_chars": len(text),
+                    "text": text, "parts": out})
+
 @app.route('/api/tree')
 def get_tree():
-    tree = load_tree()
-    # 深拷贝一份，去掉节点中的大字段
-    slim_nodes = {}
-    for nid, node in tree["nodes"].items():
-        slim = {
-            "id": node["id"],
-            "parentId": node["parentId"],
-            "title": node["title"],
-            "generating": node.get("generating", False),
-            "children": node.get("children", []),
-            "createdAt": node.get("createdAt"),
-            "last_update": node.get("last_update")
-        }
-        slim_nodes[nid] = slim
-    slim_tree = {
-        "root": tree["root"],
-        "nodes": slim_nodes
-    }
-    return jsonify(slim_tree)
+    # ★ 2026-11-11（问题3）：不再"先整树深拷贝、再挑字段"——直接由 TreeManager
+    #   在锁内拼轻量视图。17MB 的树从 ~0.26s 降到微秒级，客户机再多也不怕轮询。
+    return jsonify(tree_manager.get_slim())
 
 @app.route('/api/node/<node_id>')
 def get_node(node_id):
-    node = load_tree()["nodes"].get(node_id)
+    # ★ 2026-11-11（问题3）：只复制这一个节点（20µs），不再为了一行内容深拷贝整棵树。
+    node = tree_manager.get_node(node_id)
     if not node: return jsonify({"error":"Not found"}),404
     return jsonify(node)
 
@@ -2558,7 +3295,21 @@ def load_server_settings():
 
 def save_server_settings(settings):
     """保存设置到 server/settings.json（原子写入：临时文件 + 替换）。"""
-    merged = _merge_settings(DEFAULT_SERVER_SETTINGS, settings or {})
+    # ★ 2026-11-12（重要修复）：合并基底必须是「磁盘上的现有设置」，不能是出厂默认。
+    #   原来只写 _merge_settings(DEFAULT_SERVER_SETTINGS, settings) —— 只要是**局部提交**
+    #   （例如只发 {prompts:{...}}，或只发 {idle_timeout:30}），缺省的键就会被
+    #   DEFAULT_SERVER_SETTINGS 覆盖：providers 是数组，直接整体替换成出厂模板
+    #   （单家 DeepSeek + flash/pro），用户的 Ollama / 自定义模型 / provider 级 api_key
+    #   全被冲掉，界面上表现为"模型只剩 deepseek 两个""API 密钥未配置"。
+    #   正确顺序：默认值打底 → 叠磁盘现值 → 再叠本次提交。
+    try:
+        _disk = json.loads(open(SERVER_SETTINGS_FILE, 'r', encoding='utf-8').read())
+        if not isinstance(_disk, dict):
+            _disk = {}
+    except Exception:
+        _disk = {}
+    merged = _merge_settings(DEFAULT_SERVER_SETTINGS, _disk)
+    merged = _merge_settings(merged, settings or {})
     merged = _migrate_prompt_keys(merged)
     # ★ 2026-10-14：扁平键 api_key 的脱敏保护（与 providers 同理）
     try:
@@ -2596,9 +3347,9 @@ def save_server_settings(settings):
         _clean_in = [_norm_provider(x, i) for i, x in enumerate(provs)]
         for _i, _cp in enumerate(_clean_in):
             _sub = (_cp.get('api_key') or '').strip()
-            _prev = ''
-            if _i < len(_old_provs):
-                _prev = str((_old_provs[_i] or {}).get('api_key') or '').strip()
+            # ★ 2026-11-13：按身份找旧配置，不再按下标（见 _find_old_provider）
+            _op = _find_old_provider(_old_provs, _cp, _i)
+            _prev = str((_op or {}).get('api_key') or '').strip()
             if _sub == '__CLEAR__':
                 _cp['api_key'] = ''
             elif (not _sub) or ('*' in _sub):
@@ -2608,6 +3359,12 @@ def save_server_settings(settings):
                     logging.info(f"[SETTINGS] providers[{_i}] 提交的是脱敏/空 key，已保留磁盘上的真 key")
                 else:
                     _cp['api_key'] = _prev
+            else:
+                # ★ 2026-11-13（追查「key 莫名其妙变了」）：真正写入新 key 时留痕。
+                #   只记长度和末 4 位，不落明文；以后再看日志就能判断是"人改了"
+                #   还是"程序把它换掉了"（后者会伴随下面这行缺少或尾号对不上）。
+                logging.info(f"[SETTINGS] providers[{_i}]({_cp.get('name')}) 写入新 key: "
+                             f"len={len(_sub)} tail=...{_sub[-4:]}")
         provs = _clean_in
         clean = _clean_in
         merged["providers"] = clean
@@ -3002,7 +3759,9 @@ def _emit_agent(a, evt):
     q = a.get("event_queue")
     if q is not None:
         try:
-            q.put(evt)
+            q.put_nowait(evt)      # ★ 同上：不阻塞
+        except queue.Full:
+            pass
         except Exception:
             pass
 
@@ -3083,6 +3842,7 @@ def _cmd_title(cmd_str):
     if h.startswith("#kill"): return "🗑️ 销毁子 Agent / 任务"
     if h == "#agents": return "📋 列出子 Agent"
     if h.startswith("#return"): return "📤 返回里程碑"
+    if h.startswith("#config"): return "⚙️ 修改会话配置"
     if h.startswith("#web_search"): return "🔍 联网搜索"
     if h.startswith("#web_fetch"): return "🌐 抓取网页(Markdown)"
     if h.startswith("#exec"): return "💻 执行 cmd 命令"
@@ -3120,14 +3880,28 @@ def _cmd_title(cmd_str):
 def spawn_agent(parent_sid, task, model, effort, thinking):
     """创建子 agent 并启动其工作线程。返回 agent ID（以 A 开头）。"""
     aid = "A" + str(uuid.uuid4())[:8]
+    _parent_pid = ""
     with sessions_lock:
         sess = sessions.get(parent_sid)
         if sess:
             sess["live_children"] = sess.get("live_children", 0) + 1
+            _parent_pid = sess.get("provider_id") or ""
+    # ★ 问题1：子 agent 默认**沿用父会话的提供商** —— 两家模型名一样时，
+    #   只有 provider_id 能区分是谁的 Key。仅当该提供商下没有这个模型
+    #   （父让子用另一家的模型，如 Qwen）时，才按模型名重新解析。
+    _child_pid = _parent_pid
+    _ppr = get_provider_by_id(_parent_pid) if _parent_pid else None
+    _has_model = bool(_ppr) and any((m.get("name") == model) or (m.get("alias") == model)
+                                    for m in (_ppr.get("models") or []))
+    if not _has_model:
+        _rpr, _rm = resolve_model(model)
+        if _rpr:
+            _child_pid = _rpr.get("id") or ""
     a = {
         "id": aid,
         "parent_sid": parent_sid,
         "model": model,
+        "provider_id": _child_pid,   # ★ 问题1：子 agent 自己的提供商
         "reasoning_effort": effort,
         "thinking_enabled": thinking,
         "status": "running",
@@ -3668,7 +4442,7 @@ DEEPSEEK_TOOLS_PRICE_PER_1K = 5.0     # 默认：元 / 1000 次成功请求
 # ★ 2026-10-23：服务器版本号 —— **最新版本以此为准**。
 #   注入页面后由前端与本地代理自报的版本比对，低则提示升级。
 #   未标记版本的老代理按 '2.0' 处理。
-APP_VERSION = '2.1'
+APP_VERSION = '2.3.7'
 
 
 def web_tool_price_per_1k():
@@ -4340,6 +5114,133 @@ def resolve_server_command(cmd_str, ctx):
             note += "\n" + _plan_note
         return note, 0
 
+    # ==================== 会话配置：#config <json> ====================
+    # ★ 2026-11-11（按用户要求）：模型可以读写本会话的配置 —— 工具开关、工具设置、
+    #   消息投递方式、对话标题。改动写回会话 settings（下一轮工具列表会按它重建），
+    #   同时 emit 一个 session_settings 事件，前端据此刷新设置面板并持久化，
+    #   否则前端下一条消息会把旧 settings 再发回来、把模型的改动覆盖掉。
+    if cmd_str.startswith("#config"):
+        sid_cfg = ctx.get("session_id")
+        emit_cfg = ctx.get("emit")
+        raw = cmd_str[len("#config"):].strip()
+        try:
+            req = json.loads(raw) if raw else {"action": "get"}
+            if not isinstance(req, dict):
+                req = {"action": "get"}
+        except Exception:
+            return _json_err('#config 参数必须是 JSON，例如 {"action":"get"}'), -1
+        with sessions_lock:
+            _sc = sessions.get(sid_cfg)
+            if _sc is None:
+                return _json_err("会话不存在（可能已被清理），无法读写配置"), -1
+            cfg = copy.deepcopy(_sc.get("settings") or {})
+        cfg.setdefault("tools", {})
+        cfg.setdefault("msg_delivery", {})
+
+        _NUM = {
+            "idle_timeout": (1, 3600, int),
+            "max_timeout": (10, 86400, int),
+            "autosave_interval": (30, 86400, int),
+            "process_refresh": (1, 3600, int),
+            "process_truncate": (100, 1000000, int),
+            "list_limit": (1, 10000, int),
+            "max_subagents": (1, 32, int),
+            "ctx_warn_ratio": (0.01, 1.0, float),
+        }
+        _CHANNELS = ("user", "timer", "agent_return", "ask_user")
+        action = str(req.get("action") or "get").strip().lower()
+        changed = {}
+
+        if action == "set":
+            key = str(req.get("key") or "").strip()
+            val = req.get("value")
+            if key.startswith("msg_delivery."):
+                ch = key.split(".", 1)[1].strip()
+                if ch not in _CHANNELS:
+                    return _json_err(f"消息投递渠道只能是 {', '.join(_CHANNELS)}"), -1
+                mode = str(val or "").strip().lower()
+                if mode not in ("interject", "queue"):
+                    return _json_err("消息投递方式只能是 interject（插话）或 queue（排队）"), -1
+                cfg["msg_delivery"][ch] = mode
+                changed[key] = mode
+            elif key in _NUM:
+                lo, hi, typ = _NUM[key]
+                try:
+                    nv = int(float(val)) if typ is int else float(val)
+                except Exception:
+                    return _json_err(f"{key} 需要数字，收到: {val!r}"), -1
+                if typ is float and nv > 1:
+                    nv = nv / 100.0          # 允许用 50 表示 50%
+                nv = max(lo, min(hi, nv))
+                cfg[key] = nv
+                changed[key] = nv
+            else:
+                return _json_err("不支持的配置项: %s（可用: %s, msg_delivery.user/timer/agent_return/ask_user）"
+                                 % (key, ", ".join(_NUM.keys()))), -1
+        elif action == "set_tool":
+            want = str(req.get("tool") or "").strip().lower()
+            if not want:
+                return _json_err("set_tool 需要 tool（分组名或工具名）"), -1
+            grp = want if want in TOOL_GROUPS else None
+            if grp is None:
+                for g, tl in TOOL_GROUPS.items():
+                    if want in tl:
+                        grp = g
+                        break
+            if grp is None:
+                return _json_err("未知工具/分组: %s（可用分组: %s）" % (want, ", ".join(TOOL_GROUPS.keys()))), -1
+            en = bool(req.get("enabled", True))
+            cfg["tools"][grp] = en
+            changed["tools." + grp] = en
+        elif action == "set_title":
+            title = str(req.get("title") or "").strip()
+            if not title:
+                return _json_err("set_title 需要 title"), -1
+            title = title[:40]
+            # ★ 2026-11-11（按用户澄清）：这里要改的是「会话属性 → 标题」，
+            #   也就是导出操作记录时用的那个文件名（与面板「保存」按钮同一个字段），
+            #   **不是**对话树里某个节点的标题 —— 操作模式根本没有节点。
+            #   现在直接写会话统计台账，与 /api/session_title 完全同源。
+            with sessions_lock:
+                _st_t = _sess_stats(sid_cfg)
+                if _st_t is not None:
+                    _st_t["title"] = title
+            if _st_t is None:
+                return _json_err("会话统计台账不可用，无法改标题"), -1
+            changed["title"] = title
+        elif action != "get":
+            return _json_err("action 只能是 get / set / set_tool / set_title"), -1
+
+        if action != "get":
+            with sessions_lock:
+                _sc3 = sessions.get(sid_cfg)
+                if _sc3 is not None:
+                    _sc3["settings"] = cfg
+            if emit_cfg:
+                try:
+                    emit_cfg({"type": "session_settings", "settings": cfg, "changed": changed})
+                    if "title" in changed:
+                        # 只带 title：前端据此更新「会话属性」面板输入框 + 导出文件名。
+                        emit_cfg({"type": "session_title", "title": changed["title"],
+                                  "session_id": sid_cfg})
+                except Exception:
+                    pass
+
+        if action == "get" and not changed:
+            lines = ["当前会话配置："]
+            lines.append("工具开关：" + "、".join(
+                f"{g}={ '开' if cfg['tools'].get(g, g in DEFAULT_TOOL_GROUPS) else '关' }"
+                for g in TOOL_GROUPS))
+            md = cfg.get("msg_delivery") or {}
+            lines.append("消息投递：" + "、".join(f"{c}={md.get(c, 'queue')}" for c in _CHANNELS))
+            lines.append("工具设置：" + "、".join(f"{k}={cfg.get(k)}" for k in _NUM))
+            return json.dumps({"success": True, "settings": cfg, "summary": "\n".join(lines)},
+                              ensure_ascii=False), 0
+
+        return json.dumps({"success": True, "changed": changed,
+                           "note": "已生效（工具开关在下一轮重建工具列表时生效）",
+                           "settings": cfg}, ensure_ascii=False), 0
+
     # ==================== 上下文压缩：#compress <摘要> ====================
     # 删除此前所有对话/工具历史，只保留 system + 摘要（含 plan/运行任务/子agent 信息），返回给模型。
     if cmd_str.startswith("#compress"):
@@ -4509,6 +5410,7 @@ You are a DeepSeek Sub-Agent (worker), created by a parent Agent to complete the
 - Wrap LaTeX math in $...$ or $$...$$; do not use \\(...\\) or \\[...\\].
 - **Bold formatting**: when using `**text**`, make sure the first and last characters inside the `**` are **not punctuation**.
 - When you need the user to open or use a local file directly, use the format `[文件: 完整路径]` in the final answer; do not reference local files with `[文件](路径)`.
+  **The path MUST be absolute** (e.g. `[文件: D:/.../workspace/README.md]`). Never write relative paths such as `workspace/README.md`, `./README.md`, or bare file names — they cannot be opened on the user's machine.
 
 ## Multi-Turn Strategy
 - For complex tasks, first produce a step plan, then execute and verify step by step, instead of generating all files in one shot.
@@ -4563,7 +5465,10 @@ def _emit(session_id, evt):
         sess = sessions.get(session_id)
         if sess and sess.get("event_queue") is not None:
             try:
-                sess["event_queue"].put(evt)
+                # ★ 2026-11-11：put_nowait，避免前端读得慢时把生成线程堵住
+                sess["event_queue"].put_nowait(evt)
+            except queue.Full:
+                pass
             except Exception:
                 pass
 
@@ -4754,7 +5659,7 @@ def session_info():
         if not internal:
             _inj = sess.get("injected_context")
             if isinstance(_inj, list) and _inj:
-                internal = [{"role": "system", "content": build_agent_system(dict(sess.get("settings") or {}))}] + list(_inj)
+                internal = _with_system(build_agent_system(dict(sess.get("settings") or {})), _inj)
         model = sess.get("model") or ""
         usage = dict(sess.get("usage_ref") or {})
         settings = dict(sess.get("settings") or {})
@@ -4764,12 +5669,23 @@ def session_info():
         "system": 0, "tools": 0, "user": 0, "llm": 0, "tool": 0, "total": 0}
     auto_title = ""
     try:
+        _sticky = str((sess or {}).get("auto_title_sticky") or "") if sess else ""
         for m in internal:
             if isinstance(m, dict) and m.get("role") == "user":
                 c = m.get("content")
                 if isinstance(c, str) and c.strip():
+                    # ★ 2026-11-13（用户："上下文压缩之后会话标题怎么成这样了"）：
+                    #   压缩后的摘要消息也是 role=user，内容是「【上下文压缩】此前所有对话…」，
+                    #   它排在 internal[1]，于是 auto_title 被它冲掉，标题/导出文件名全变成这句话。
+                    #   跳过这类标记消息；全被跳过时沿用压缩前记下的标题（sticky）。
+                    if _is_compress_marker_text(c):
+                        continue
                     auto_title = _summarize_title(c)
                     break
+        if not auto_title and _sticky:
+            auto_title = _sticky
+        if auto_title and sess is not None:
+            sess["auto_title_sticky"] = auto_title
     except Exception:
         auto_title = ""
     busy_ms = llm_ms + tool_ms
@@ -4845,9 +5761,29 @@ def session_title_set():
     return jsonify({"success": True, "title": title})
 
 
+# 用户消息开头的来源元数据（见 run_parent_loop 的 _user_meta / /chat 对话模式）
+_USER_META_LEAD_RE = re.compile(r'^\s*(?:\[时间:[^\]]*\]\s*)?(?:\[IP:[^\]]*\]\s*)?')
+
+
+def _is_compress_marker_text(s):
+    """这条消息是不是「上下文压缩」产生的标记（摘要 / 用户点了压缩的提示）。
+
+    ★ 2026-11-13：这类消息绝不能被当成"用户的第一句话"去生成标题。
+    """
+    t = str(s or '').lstrip()
+    if not t:
+        return False
+    return (t.startswith("【上下文压缩】")
+            or ('此前所有对话与工具历史已删除' in t[:80])
+            or t.startswith("🧹 用户执行上下文压缩"))
+
+
 def _summarize_title(text, max_len=24):
     """把一段文本压成简短标题（导出文件名/会话标题的“自动总结”）。"""
     s = re.sub(r'\s+', ' ', str(text or '')).strip()
+    # ★ 2026-11-11：用户消息前面现在带 `[时间: ...] [IP: ...]` 元数据，
+    #   自动标题必须扔掉它，否则标题/导出文件名会变成 "[时间: 2026-11-11T..."。
+    s = _USER_META_LEAD_RE.sub('', s, count=1)
     s = re.sub(r'[#*`>_~\[\]()]', '', s)
     s = re.sub(r'^[-—•\s]+', '', s).strip()
     if len(s) > max_len:
@@ -5126,6 +6062,11 @@ def operation_input():
         if data.get('model'):
             sess['model'] = data['model']
             logging.info(f"[OPERATE] {sid} 模型切换为 {data['model']}")
+        # ★ 问题1：提供商也随消息同步 —— 同名模型切换时，只有它能区分扣谁的 Key
+        _in_pid = str(data.get('provider_id') or '').strip()
+        if _in_pid:
+            sess['provider_id'] = _in_pid
+            logging.info(f"[OPERATE] {sid} 提供商切换为 {_in_pid}")
         # ★ FIX(2026-09-11 v4)：思考强度 / 思考开关同样随消息同步（此前中途切换不生效）
         if data.get('reasoning_effort'):
             sess['reasoning_effort'] = data['reasoning_effort']
@@ -5378,6 +6319,156 @@ def _clean_injected_messages(messages):
                     # ★ FIX(400 reasoning_content)：thinking 模式历史消息必须带该字段
                     "reasoning_content": ""})
     return out
+
+# ===== 操作记录：自动保存 / 最近记录（2026-11-12 用户需求）=====
+#   把「导出操作记录」那份 JSON 定时存到服务端，进入操作界面后右侧列出「最近记录」，
+#   点一条直接导入回放；不点、直接发消息就是新对话。
+#   落盘：WORK_DIR/op_records/<id>.json + index.json（列表只读索引，避免扫大文件）。
+OP_REC_DIR = os.path.join(WORK_DIR, 'op_records')
+OP_REC_INDEX = os.path.join(OP_REC_DIR, 'index.json')
+OP_REC_MAX = 50          # 最多保留多少条（按最近修改时间淘汰）
+
+
+def _op_rec_clean_id(rid):
+    rid = re.sub(r'[^A-Za-z0-9_.-]', '', str(rid or ''))[:64]
+    return rid
+
+
+def _op_rec_load_index():
+    try:
+        with open(OP_REC_INDEX, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, list):
+            return [it for it in d if isinstance(it, dict) and it.get('id')]
+    except Exception:
+        pass
+    return []
+
+
+def _op_rec_save_index(items):
+    try:
+        os.makedirs(OP_REC_DIR, exist_ok=True)
+        tmp = OP_REC_INDEX + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(items, f, ensure_ascii=False)
+        os.replace(tmp, OP_REC_INDEX)
+    except Exception as e:
+        logging.warning(f'[OP-REC] 索引写入失败: {e}')
+
+
+@app.route('/api/op_record/save', methods=['POST'])
+def op_record_save():
+    """保存/更新一条操作记录（前端每隔一段时间自动调用，同一个 id 会覆盖）。"""
+    d = request.get_json(silent=True) or {}
+    data = d.get('data')
+    if not isinstance(data, dict) or not isinstance(data.get('events'), list):
+        return jsonify({"error": "data 无效（缺少 events）"}), 400
+    rid = _op_rec_clean_id(d.get('id')) or ('op-' + uuid.uuid4().hex[:12])
+    events = data.get('events') or []
+    if len(events) > 20000:                       # 防爆：只留最后 2 万条
+        events = events[-20000:]
+        data['events'] = events
+    title = str(d.get('title') or ((data.get('stats') or {}).get('title')) or '未命名记录')[:120]
+    try:
+        os.makedirs(OP_REC_DIR, exist_ok=True)
+        path = os.path.join(OP_REC_DIR, rid + '.json')
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        logging.warning(f'[OP-REC] 保存失败 {rid}: {e}')
+        return jsonify({"error": str(e)}), 500
+    items = [it for it in _op_rec_load_index() if it.get('id') != rid]
+    items.insert(0, {
+        "id": rid, "title": title, "saved_at": time.time(),
+        "events": len(events), "size": os.path.getsize(path),
+        "model": (data.get('meta') or {}).get('model') or '',
+    })
+    for old in items[OP_REC_MAX:]:                 # 超量的连文件一起清掉
+        try:
+            os.remove(os.path.join(OP_REC_DIR, _op_rec_clean_id(old.get('id')) + '.json'))
+        except Exception:
+            pass
+    items = items[:OP_REC_MAX]
+    _op_rec_save_index(items)
+    logging.info(f'[OP-REC] 已保存 {rid}（{len(events)} 事件，{os.path.getsize(os.path.join(OP_REC_DIR, rid + ".json"))//1024}KB）')
+    return jsonify({"success": True, "id": rid, "saved_at": items[0]["saved_at"], "events": len(events)})
+
+
+@app.route('/api/op_record/list', methods=['GET'])
+def op_record_list():
+    items = _op_rec_load_index()
+    alive = [it for it in items
+             if os.path.exists(os.path.join(OP_REC_DIR, _op_rec_clean_id(it.get('id')) + '.json'))]
+    if len(alive) != len(items):
+        _op_rec_save_index(alive)                  # 顺手清理已被手工删掉的条目
+    return jsonify({"records": alive})
+
+
+@app.route('/api/op_record/<rid>', methods=['GET'])
+def op_record_get(rid):
+    rid = _op_rec_clean_id(rid)
+    path = os.path.join(OP_REC_DIR, rid + '.json')
+    if not rid or not os.path.exists(path):
+        return jsonify({"error": "记录不存在"}), 404
+    return send_file(path, mimetype='application/json')
+
+
+@app.route('/api/op_record/delete', methods=['POST'])
+def op_record_delete():
+    d = request.get_json(silent=True) or {}
+    rid = _op_rec_clean_id(d.get('id'))
+    if rid:
+        try:
+            os.remove(os.path.join(OP_REC_DIR, rid + '.json'))
+        except Exception:
+            pass
+        _op_rec_save_index([it for it in _op_rec_load_index() if it.get('id') != rid])
+    return jsonify({"success": True})
+
+
+@app.route('/api/server_log', methods=['GET'])
+def server_log_tail():
+    """只读：返回服务端日志最后 N 行，方便远程排查（生产服在本机不方便登录时尤其有用）。
+
+    ★ 2026-11-12（用户要求）：
+      参数：lines=N（默认 200，最大 5000）、grep=关键字（大小写不敏感，按子串过滤）。
+      实现：从文件**尾部**读最多 2MB 再切行，这么大的日志文件也不会卡住请求。
+      注意：日志里可能有会话 id、提示词片段，属于内网调试接口，不要把 5000 暴露到公网。
+    """
+    try:
+        n = int(request.args.get('lines', '200'))
+    except Exception:
+        n = 200
+    n = max(1, min(n, 5000))
+    kw = (request.args.get('grep') or '').strip()
+    path = os.path.join(_log_dir(), 'server.log')
+    if not os.path.exists(path):
+        return Response(f'# server.log 不存在：{path}\n', mimetype='text/plain; charset=utf-8')
+    try:
+        size = os.path.getsize(path)
+        chunk = min(size, 2 * 1024 * 1024)
+        with open(path, 'rb') as f:
+            f.seek(max(0, size - chunk))
+            data = f.read()
+        text = data.decode('utf-8', 'replace')
+        lines = text.splitlines()
+        if chunk < size and lines:
+            lines = lines[1:]                 # 第一行可能被切断，丢掉
+        if kw:
+            low = kw.lower()
+            lines = [ln for ln in lines if low in ln.lower()]
+        tail = lines[-n:]
+        mtime = datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')
+        head = (f'# {path}  {size / 1048576:.1f}MB  mtime={mtime}  '
+                f'返回 {len(tail)} 行' + (f'（grep={kw}）' if kw else '') + '\n')
+        resp = Response(head + '\n'.join(tail) + '\n', mimetype='text/plain; charset=utf-8')
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
+    except Exception as e:
+        return Response(f'# 读取失败：{e}\n', mimetype='text/plain; charset=utf-8')
+
 
 @app.route('/api/operation_import', methods=['POST'])
 def operation_import():
@@ -6102,7 +7193,41 @@ ASK_USER_TOOL = {
     }
 }
 
-PARENT_TOOLS = COMMON_TOOLS + AGENT_TOOLS + [ASK_USER_TOOL]
+# ★ 2026-11-11（按用户要求）：让模型能读写**本会话**的配置。
+#   默认关闭（TOOL_GROUPS 里单列 config 组，DEFAULT_TOOL_GROUPS 不含它），
+#   用户勾上之后模型才可以自己开关工具、调工具设置、改对话标题。
+SESSION_CONFIG_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "session_config",
+        "description": ("读取/修改**当前会话**的配置。适用场景：用户说“把网页搜索关掉”“超时给长一点”"
+                        "“子代理多开几个”“把标题改成 X”时，直接改配置而不是让用户去点设置。"
+                        "action=get 先看当前值；set 改单个设置项；set_tool 开关某组工具；"
+                        "set_title 改「会话属性 → 标题」（保存/导出操作记录时用作文件名）。"
+                        "改动立即写回会话并同步到网页设置面板。"),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["get", "set", "set_tool", "set_title"],
+                           "description": "get=读取全部配置；set=改一个设置项；set_tool=开关一组工具；set_title=改会话标题"},
+                "key": {"type": "string",
+                        "description": ("set 用。可选项：idle_timeout(同步命令无输出超时,秒) / max_timeout(最大超时,秒) / "
+                                        "autosave_interval(自动保存间隔,秒) / process_refresh(进程视图刷新,秒) / "
+                                        "process_truncate(工具输出截断字符数) / list_limit(list 记忆条数) / "
+                                        "max_subagents(最大子代理数) / ctx_warn_ratio(上下文警告阈值,0-1 或 1-100) / "
+                                        "msg_delivery.user|timer|agent_return|ask_user(interject=插话, queue=排队)")},
+                "value": {"description": "set 用的新值（数字或短字符串）"},
+                "tool": {"type": "string",
+                         "description": "set_tool 用：分组名 file/cmd/web/screen/memory/plan/agent/compress/ask_user/config，或组内任一工具名"},
+                "enabled": {"type": "boolean", "description": "set_tool 用：true=开启，false=关闭"},
+                "title": {"type": "string", "description": "set_title 用：新的会话标题（建议 4-20 字；即「会话属性 → 标题」，也是导出操作记录的文件名）"}
+            },
+            "required": ["action"]
+        }
+    }
+}
+
+PARENT_TOOLS = COMMON_TOOLS + AGENT_TOOLS + [ASK_USER_TOOL, SESSION_CONFIG_TOOL]
 # ★ 子 agent 不能访问“任务计划”工具（#plan）：子代理创建/修改任务计划会与父代理的
 #   任务视图互相打架，因此从 COMMON_TOOLS 中剔除 plan 后再组装子代理工具列表。
 CHILD_TOOLS = [t for t in COMMON_TOOLS if t["function"]["name"] != "plan"] + [RETURN_TOOL]
@@ -6122,11 +7247,14 @@ TOOL_GROUPS = {
     "agent":  ["spawn_agent", "prompt_agent", "query_agent", "kill_agent", "list_agents"],
     "compress": ["compress_context"],
     "ask_user": ["ask_user"],
+    # ★ 2026-11-11：会话配置（读写本会话设置）。不在 DEFAULT_TOOL_GROUPS 里 = 默认关闭。
+    "config": ["session_config"],
 }
 TOOL_GROUP_NAMES = {
     "file": "文件读写", "cmd": "执行命令", "web": "网页抓取",
     "screen": "屏幕与桌面操作", "memory": "记忆管理", "plan": "任务计划",
     "agent": "子代理管理", "compress": "上下文管理", "ask_user": "询问用户",
+    "config": "会话配置（模型可改设置）",
 }
 # ★ 2026-09-29（按用户要求）：默认只开这几个分组，其余默认关闭。
 DEFAULT_TOOL_GROUPS = ("file", "cmd", "web", "memory", "plan", "compress", "ask_user")
@@ -6208,9 +7336,11 @@ You are DeepSeek Operator, an AI assistant that fulfills user requests by execut
 
 ## Output Standards
 - Use Markdown for readability.
+- Draw structured content (flowcharts, sequence diagrams, architecture, state machines, ER diagrams, Gantt charts, mind maps) as a ```mermaid code block — it renders with copy and download buttons. ER relationship labels must be double-quoted.
 - LaTeX math: inline `$...$` or `\(...\)`, block `$$...$$` or `\[...\]` — all four forms render correctly, use whichever you prefer.
 - In `**bold**`, the first and last characters inside the asterisks must not be punctuation.
 - To let the user open a local file, write `[文件: 完整路径]` in the final answer (clicking opens it on their machine). Do not use `[文件](路径)`.
+  The path **must be absolute** and point at a file that actually exists (e.g. `[文件: D:/.../client/workspace/README.md]`). Never emit relative paths like `workspace/README.md`, `workspace/workspace/...`, or a bare file name.
 
 ## Multi-Turn Strategy
 - For complex tasks: plan first, then execute and verify step by step; do not generate everything in one shot.
@@ -6251,6 +7381,13 @@ DEFAULT_PROMPT_SECTIONS = {
 - The summary must cover: (1) user requirements (2) completed progress (3) important information gathered (4) what to do next (5) paths to key files.
 - Compression deletes all prior conversation and tool history, keeping only: the system prompt, your summary, the task plan (`#plan`), running async/scheduled tasks (commands + IDs), and sub-agents (ID + last prompt).
 - After compressing, continue from the summary; do not redo completed work. Load details back from the memory store with `load` if needed.""",
+    "config": """## Session Config (session_config)
+When the user says "turn off web search", "give it more time", "allow more sub-agents", "rename this chat", do it yourself with `session_config` instead of telling them to open Settings.
+- `action=get` — read current values (do this first if unsure).
+- `action=set` — `key` = idle_timeout | max_timeout | autosave_interval | process_refresh | process_truncate | list_limit | max_subagents | ctx_warn_ratio | msg_delivery.user|timer|agent_return|ask_user (=interject or queue), `value` = new value.
+- `action=set_tool` — `tool` = a group (file/cmd/web/screen/memory/plan/agent/compress/ask_user/config) or any tool name, `enabled` = true/false.
+- `action=set_title` — `title` = new session title (4-20 chars). This is the "会话属性 → 标题" field (also the export file name), NOT a conversation-tree node.
+Changes apply immediately and are mirrored into the web settings panel. Tool on/off takes effect on the next round. Never change settings the user did not ask about.""",
     "screen": """## Screen Operations
 - By default you act on a hidden virtual desktop so the user is not disturbed; pass `real=true` to screen tools to operate the user's actual desktop (real-desktop mode needs no create/close). The user can watch live via the "AI 屏幕监控" panel.
 - Prefer Playwright, FFmpeg, grep, ImageMagick; OCR + simulated keyboard/mouse is the last resort.
@@ -6269,6 +7406,16 @@ DEFAULT_PROMPT_SECTIONS = {
 - To understand image content (describe an image, read text off a screenshot, analyse a chart), call the `view_image` tool with the image path (absolute, or relative to workspace); the system returns the image to you.
 - Images may only appear in user messages (handled automatically); the total image size per request is limited, so call it as needed.
 - If the routed model does not support image understanding the API returns an error; switch the model in Settings -> Model & Pricing and retry.""",
+    "mermaid": """## Diagrams (Mermaid)
+- When a flow, sequence, architecture, state machine, ER model, timeline or Gantt chart explains something better than prose, **draw it** with a ```mermaid fenced code block. The web UI renders it as a real diagram with copy / download-PNG / download-SVG / copy-code buttons.
+- Never hand-draw diagrams with ASCII art, and never describe a graph purely in words when a diagram would be clearer.
+- Keep it readable: short node labels; split a huge graph into 2-3 small ones. Supported: flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, erDiagram, gantt, journey, mindmap, timeline, pie, quadrantChart.
+- **Syntax rules that actually break rendering — follow them exactly:**
+  - First line inside the fence must be the diagram type alone (`flowchart TD`, `erDiagram`, `sequenceDiagram`, …). One statement per line; never put two relationships on the same line.
+  - **ER diagram: entity names are ASCII only** (letters/digits/underscore — `USER`, `ORDER_ITEM`, never `用户`), and **every relationship label must be double-quoted**: `USER ||--o{ ORDER : "下单"`. A bare Chinese label is the single most common parse failure.
+  - Any node/label text containing `(`, `)`, `:`, `/`, `,`, `%`, `"` must be wrapped in double quotes: `A["耗时(ms)"]`.
+  - Gantt: dates are `YYYY-MM-DD`; task line format `任务名 :done, 2026-01-01, 3d`.
+  - Do not use HTML tags or `style` attributes inside labels; keep them plain text.""",
     "safety": """## Safety and Basic Rules
 - The dangerous-command blacklist is enforced by the system; do not generate such commands.
 - Avoid `sudo`.
@@ -6283,9 +7430,14 @@ DEFAULT_PROMPT_SECTIONS = {
 - Synchronous (default) blocks until all questions are answered; asynchronous (`async=true`) returns immediately and delivers the answers later like a scheduled task -- use it for secondary questions you can work around.""",
 }
 
-def build_agent_system(settings):
-    """根据设置弹窗的工具开关动态生成父 agent 系统提示词：
-    被禁用的工具组其提示词段落一并移除；用户在“提示词”标签页保存的覆盖文本优先于内置默认。"""
+def _agent_system_parts(settings):
+    """操作模式系统提示词的分段明细 [(key, text, source)]，source ∈ default/override/off。
+
+    ★ 与 build_agent_system 共用，保证「预览」和「实际发出」永远一致。
+    一段文字要拼进去，必须同时满足：
+      1) 对应工具开关是开的（关掉工具后它的使用说明没有意义）
+      2) prompts.off 里没有显式关闭它（★2026-11-12：想省 context 但保留工具时用这个）
+    """
     st = (settings or {}).get("tools") or {}
     def on(g):
         return st.get(g, True)
@@ -6295,38 +7447,44 @@ def build_agent_system(settings):
         _max_sub = max(1, int((settings or {}).get("max_subagents", 3) or 3))
     except Exception:
         _max_sub = 3
-    _prompts = load_server_settings().get("prompts") or {}
     # ★ 操作模式基础提示词用 agent_base（与对话模式的 chat_base 完全独立）
-    _ov_base = str(_prompts.get("agent_base") or "").strip()
-    _ov_sections = _prompts.get("sections") or {}
-    def _sec(key, default):
-        v = _ov_sections.get(key)
-        if isinstance(v, str) and v.strip():
-            return v
-        return default
-    secs = []
-    secs.append(_ov_base if _ov_base else DEFAULT_PROMPT_BASE)
-    if on("agent"):
-        secs.append(_sec("agent", DEFAULT_PROMPT_SECTIONS["agent"].format(max_subagents=_max_sub)))
+    p, _ov_sections, off, base_off = _prompt_state()
+    parts = []
+
+    def push(key, default, enabled=True):
+        if not enabled:
+            parts.append((key, "", "off"))
+            return
+        t = _sec_text(key, default, _ov_sections, off)
+        if t is None:
+            parts.append((key, "", "off"))
+            return
+        parts.append((key, t, "override" if (_ov_sections.get(key) or "").strip() else "default"))
+
+    base = _base_text(p, "agent_base", DEFAULT_PROMPT_BASE, base_off)
+    _ovb = (str(p.get("agent_base") or "")).strip()
+    parts.append(("agent_base", base, "off" if not base else ("override" if _ovb else "default")))
+    push("agent", DEFAULT_PROMPT_SECTIONS["agent"].format(max_subagents=_max_sub), on("agent"))
     # ★ 2026-10-14（分组重组）：定时/执行类提示词挂在 "cmd" 分组下（原 timer）
-    if on("cmd") or on("agent"):
-        secs.append(_sec("agent_timer", DEFAULT_PROMPT_SECTIONS["agent_timer"]))
-    if on("cmd"):
-        secs.append(_sec("cmd", DEFAULT_PROMPT_SECTIONS["cmd"]))
-    if on("plan") or on("memory"):
-        secs.append(_sec("plan_memory", DEFAULT_PROMPT_SECTIONS["plan_memory"]))
-    secs.append(_sec("ask_user", DEFAULT_PROMPT_SECTIONS["ask_user"]))
-    if on("compress"):
-        secs.append(_sec("compress", DEFAULT_PROMPT_SECTIONS["compress"]))
-    if on("screen"):
-        secs.append(_sec("screen", DEFAULT_PROMPT_SECTIONS["screen"]))
-    if on("web"):
-        secs.append(_sec("web", DEFAULT_PROMPT_SECTIONS["web"]))
-    secs.append(_sec("long_output", DEFAULT_PROMPT_SECTIONS["long_output"]))
-    if on("file"):
-        secs.append(_sec("file", DEFAULT_PROMPT_SECTIONS["file"]))
-    secs.append(_sec("safety", DEFAULT_PROMPT_SECTIONS["safety"].format(max_timeout_min=max_timeout // 60, idle_timeout=idle_timeout)))
-    return "\n\n".join(secs)
+    push("agent_timer", DEFAULT_PROMPT_SECTIONS["agent_timer"], on("cmd") or on("agent"))
+    push("cmd", DEFAULT_PROMPT_SECTIONS["cmd"], on("cmd"))
+    push("plan_memory", DEFAULT_PROMPT_SECTIONS["plan_memory"], on("plan") or on("memory"))
+    push("ask_user", DEFAULT_PROMPT_SECTIONS["ask_user"], True)
+    push("compress", DEFAULT_PROMPT_SECTIONS["compress"], on("compress"))
+    push("screen", DEFAULT_PROMPT_SECTIONS["screen"], on("screen"))
+    push("web", DEFAULT_PROMPT_SECTIONS["web"], on("web"))
+    push("long_output", DEFAULT_PROMPT_SECTIONS["long_output"], True)
+    push("file", DEFAULT_PROMPT_SECTIONS["file"], on("file"))
+    push("config", DEFAULT_PROMPT_SECTIONS["config"], on("config"))
+    # ★ 2026-11-12（用户要求）：Mermaid 说明已并进 Output Standards 的一句话，
+    #   不再单独占一段（原来恒追加 1430 字，接本地小模型时太浪费上下文）。
+    push("safety", DEFAULT_PROMPT_SECTIONS["safety"].format(max_timeout_min=max_timeout // 60, idle_timeout=idle_timeout), True)
+    return parts
+
+
+def build_agent_system(settings):
+    """操作模式最终系统提示词。返回 '' 表示不发 system 消息（全部关掉时）。"""
+    return "\n\n".join(t for _k, t, _s in _agent_system_parts(settings) if (t or "").strip())
 
 def get_prompt_defaults():
     """“提示词”标签页展示用：三套内置默认文本（对话 / 操作 / 子 Agent）+ 各工具段落，
@@ -6361,6 +7519,12 @@ def _strip_tool_prefix(cmd, prefix):
 def tool_to_command(tool_call):
     func_name = tool_call.function.name
     args = json.loads(tool_call.function.arguments)
+    if func_name == "session_config":
+        # ★ 2026-11-11：原样打包成一条命令交给服务端处理（解析只写在一处，避免两处逻辑漂移）
+        _pl = {k: v for k, v in (args or {}).items() if v is not None}
+        if not _pl.get("action"):
+            _pl["action"] = "get"
+        return "#config " + json.dumps(_pl, ensure_ascii=False)
     if func_name == "execute_command":
         cmd = _strip_tool_prefix(args.get("command", ""), "#exec")
         if not cmd: return None
@@ -6653,6 +7817,203 @@ def _ensure_tool_pairing(internal):
         i += 1
     return changed
 
+# ★ 2026-11-13（按用户要求）：服务端→提供商的重试参数从「操作模式设置 → 重试与容错」来。
+#   前端每次请求都把 opSettings 一起带上（settings 字段），这里取最新一份存成进程级默认值 ——
+#   父循环和子 agent 线程都能直接读到，不必把参数一层层透传（子 agent 起在自己的线程里）。
+#   环境变量仍然可以兜底（LLM_MAX_RETRIES / LLM_STALL_TIMEOUT / LLM_RATE_WAIT）。
+_RETRY_KNOBS = {
+    # ★ 2026-11-13（按用户要求）：默认重试 15 次、每次间隔 5000ms。
+    #   起因：那把「每分钟只能请求一次」的免费模型，65 秒/5 次太粗 —— 现在按 5 秒一试探，
+    #   15 次共 75 秒，正好覆盖一个限流窗口。
+    "max_retries": int(os.environ.get("LLM_MAX_RETRIES", "15") or 15),
+    "stall_timeout": float(os.environ.get("LLM_STALL_TIMEOUT", "120") or 120),
+    "rate_wait": float(os.environ.get("LLM_RATE_WAIT", "5") or 5),
+    # 卡死（120 秒无任何数据）不跟着 15 次走：15×120s = 半小时，用户会以为程序挂了
+    "stall_retries": 3,
+}
+
+
+def _apply_retry_knobs(settings):
+    """把前端「重试与容错」里的值写进进程级默认值（非法值一律忽略，保持上一次的）。"""
+    s = settings or {}
+    try:
+        v = int(s.get("llm_retries"))
+        # ★ 2026-11-13（用户："怎么还最高限制 30 次，我还想调成 998244353 次"）：
+        #   上限放到 999999999。真填这么大只会在**持续失败**时触发，退避期间
+        #   每秒检查一次取消，点停止照样能停，不会把进程锁死。
+        _RETRY_KNOBS["max_retries"] = max(1, min(999999999, v))
+    except Exception:
+        pass
+    try:
+        v = float(s.get("llm_stall"))
+        if 10 <= v <= 1800:
+            _RETRY_KNOBS["stall_timeout"] = v
+    except Exception:
+        pass
+    # ★ 2026-11-13：等待时间改用**毫秒**输入（用户："原来这个不是总计，是单次"）。
+    #   新前端传 llm_rate_wait_ms；老页面仍传秒级 llm_rate_wait，两者都认。
+    _ms_ok = False
+    try:
+        v = float(s.get("llm_rate_wait_ms"))
+        if 100 <= v <= 600000:
+            _RETRY_KNOBS["rate_wait"] = v / 1000.0
+            _ms_ok = True
+    except Exception:
+        pass
+    if not _ms_ok:
+        try:
+            v = float(s.get("llm_rate_wait"))
+            if 1 <= v <= 600:
+                _RETRY_KNOBS["rate_wait"] = v
+        except Exception:
+            pass
+
+
+RETRY_SETTINGS_FILE = os.path.join(os.path.dirname(SERVER_SETTINGS_FILE), 'retry_settings.json')
+
+
+def _load_retry_settings():
+    """启动时读取「服务端↔提供商」的重试参数（对话模式与操作模式共用这一份）。"""
+    try:
+        if os.path.exists(RETRY_SETTINGS_FILE):
+            with open(RETRY_SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                _apply_retry_knobs(json.load(f))
+            logging.info(f"[RETRY] 已加载重试设置 {_RETRY_KNOBS}")
+    except Exception as e:
+        logging.warning(f"[RETRY] 读取重试设置失败（改用默认值）：{e}")
+
+
+def _retry_knobs_out():
+    """对外暴露的字段名与前端 opSettings 保持一致（llm_*）。"""
+    return {
+        'llm_retries': int(_RETRY_KNOBS.get('max_retries') or 15),
+        'llm_rate_wait_ms': int(round(float(_RETRY_KNOBS.get('rate_wait') or 5) * 1000)),
+        'llm_stall': int(round(float(_RETRY_KNOBS.get('stall_timeout') or 120))),
+    }
+
+
+@app.route('/api/retry_settings', methods=['GET', 'POST'])
+def api_retry_settings():
+    """读写重试参数。
+
+    ★ 2026-11-13（用户："对话模式有这个重试吗，对话模式设置里没找到"）：
+      对话模式以前完全没有重试（429 一次整条就失败）。现在两条模式共用这一份设置，
+      并且**持久化**到 server/workspace/retry_settings.json，重启后仍然生效。
+    """
+    if request.method == 'GET':
+        return jsonify({'success': True, 'settings': _retry_knobs_out()})
+    d = request.get_json(silent=True) or {}
+    src = d.get('settings') if isinstance(d.get('settings'), dict) else d
+    _apply_retry_knobs(src)
+    out = _retry_knobs_out()
+    try:
+        with open(RETRY_SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning(f"[RETRY] 保存重试设置失败：{e}")
+    return jsonify({'success': True, 'settings': out})
+
+
+_load_retry_settings()
+
+
+def _is_retryable_llm_error(err):
+    """这次失败值不值得重试？
+
+    ★ 2026-11-13（用户："重试不一定是 429，也可能是网络波动，不要写死 429"）：
+      分成三类：
+        ① **配置类**（401/402/403/404/422、Key 无效、模型不存在）→ 重试多少次都一样，不重试；
+        ② **暂时性**（429 限流、408/409、5xx、529，以及连接重置/超时/EOF/10054/SSL）→ 重试；
+        ③ 其他未知错误 → 交给上层报错（避免对着一个死问题刷 5 次）。
+    """
+    for _a in ("status_code", "http_status", "code"):
+        try:
+            _c = int(getattr(err, _a, 0) or 0)
+        except Exception:
+            _c = 0
+        if _c:
+            if _c in (408, 409, 425, 429):
+                return True
+            if 500 <= _c <= 599:
+                return True
+            if _c in (400, 401, 402, 403, 404, 405, 413, 415, 422):
+                return False
+    s = str(err or "").lower()
+    if any(k in s for k in ("invalid api key", "incorrect api key", "unauthorized",
+                            "authentication", "insufficient balance", "余额不足",
+                            "model not found", "does not exist", "invalid_request_error",
+                            "invalid api key provided")):
+        return False
+    if _is_rate_limited(err):
+        return True
+    # 网络类：连接被重置 / 超时 / 提前 EOF / SSL 抖动 / 对端 5xx
+    if any(k in s for k in ("timeout", "timed out", "connection", "reset", "10054",
+                            "remoteprotocolerror", "peer closed", "eof", "ssl",
+                            "temporarily unavailable", "bad gateway", "service unavailable",
+                            "gateway timeout", "502", "503", "504", "529")):
+        return True
+    return False
+
+
+def _llm_retry_wait(err, attempt):
+    """重试前等多久（秒）。
+
+    429 → 用上游的 Retry-After，没有就用「限流等待」；网络抖动 → 3s、6s、9s… 的短退避，
+    上限是「限流等待」（默认 65s），免得一次网络抖动就让用户干等一分钟。
+    """
+    if _is_rate_limited(err):
+        return _retry_after_seconds(err) or _RETRY_KNOBS["rate_wait"]
+    return min(float(_RETRY_KNOBS["rate_wait"]), 3.0 * max(1, int(attempt or 1)))
+
+
+def _lost_cmd_result(waited_s, task_id=""):
+    """等待前端回传命令结果超时时的兜底文案。
+
+    ★ 2026-11-13（用户："命令结果丢失是啥"）：原来只有四个字，既不知道为什么，
+      也没法排查。这里写清"等了多久、哪个 task、常见原因"，模型和人都能据此行动。
+    """
+    try:
+        _w = int(waited_s)
+    except Exception:
+        _w = 0
+    return (f"命令结果丢失（服务端等待 {_w}s 仍未收到浏览器回传，task={task_id or '-'}）。\n"
+            f"常见原因：页面被刷新/关闭、切到后台后浏览器掐断了请求、"
+            f"本地代理（5001 agent）断线或该命令在本地卡死。\n"
+            f"命令可能已经在本地执行过了，重新执行前请先确认副作用（写文件/提交等）。")
+
+
+def _is_rate_limited(err):
+    """判断一次 LLM 调用异常是不是「请求过快 / 额度限制」（429）。
+
+    ★ 2026-11-13：兼容各家写法 —— openai SDK 是 RateLimitError(status_code=429)，
+      有些第三方网关只在文本里给 "rate limit"/"too many requests"/"请求过于频繁"。
+    """
+    for _attr in ("status_code", "http_status", "code"):
+        try:
+            if int(getattr(err, _attr, 0) or 0) == 429:
+                return True
+        except Exception:
+            pass
+    _s = str(err).lower()
+    if "429" in _s:
+        return True
+    return any(k in _s for k in ("rate limit", "rate_limit", "too many requests",
+                                 "requests per minute", "rpm limit", "请求过于频繁",
+                                 "频率限制", "限流"))
+
+
+def _retry_after_seconds(err):
+    """取上游 Retry-After 头（秒）；没有/不是数字就返回 0（由调用方用默认等待）。"""
+    try:
+        resp = getattr(err, "response", None)
+        h = resp.headers.get("retry-after") if resp is not None else None
+        if h:
+            return max(1.0, float(str(h).strip()))
+    except Exception:
+        pass
+    return 0.0
+
+
 def _llm_stream_call(internal, model, r_eff, thinking, tools, cancel_event, usage, emit_evt, **kwargs):
     # ★ 2026-10-14：thinking 落盘用的会话标识（调用方经 kwargs 传入；没有就记 unknown）
     _dump_sid = kwargs.get('session_id') or kwargs.get('sid') or 'unknown'
@@ -6673,29 +8034,58 @@ def _llm_stream_call(internal, model, r_eff, thinking, tools, cancel_event, usag
     reset_container 让界面重开一块，避免半截内容与重试内容拼接；
     ② 只补发新增内容，不会把已显示的思考/正文重复推给前端；③ 周期性进度日志便于定位。
     """
-    LLM_STALL_TIMEOUT = float(os.environ.get("LLM_STALL_TIMEOUT", "120"))
-    LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+    # ★ 2026-11-13（按用户要求"服务端→提供商的重试也加上，默认 5"）：
+    #   优先级 = 调用方显式传参 > 进程级默认值（来自操作模式设置）> 环境变量。
+    LLM_STALL_TIMEOUT = float(kwargs.get("stall_timeout") or _RETRY_KNOBS["stall_timeout"])
+    LLM_MAX_RETRIES = max(1, int(kwargs.get("max_retries") or _RETRY_KNOBS["max_retries"]))
+    # ★ 2026-11-13：卡死（长时间无数据）单独限次 —— 15 次 × 120 秒 = 半小时，太离谱
+    LLM_STALL_RETRIES = max(1, min(int(_RETRY_KNOBS.get("stall_retries") or 3), LLM_MAX_RETRIES))
+    # 收到 429 后等多久再试：上游给了 Retry-After 就听它的，否则用这个（限「每分钟 1 次」的模型填 65 刚好）
+    LLM_RATE_WAIT = max(1.0, float(kwargs.get("rate_wait") or _RETRY_KNOBS["rate_wait"]))
 
     def _open_stream():
         # ★ 2026-10-14（多提供商）：先声明"本次调用用的是哪个模型" ——
         #   get_client() / provider_supports_thinking() 据此解析到该模型所属提供商的
         #   base_url / api_key（见 resolve_model / set_current_model）。
         set_current_model(model)
-        # ★ 2026-10-10：thinking / reasoning_effort 是 DeepSeek 专有字段。
-        #   接通用 OpenAI 兼容端点（如本地 Ollama）时必须省掉，否则对方 400：
-        #   「"qwen2.5:3b" does not support thinking」。详见 provider_supports_thinking()。
-        _use_ds = provider_supports_thinking()
-        _extra = {"thinking": {"type": "enabled" if thinking else "disabled"}} if _use_ds else None
+        # ★ 2026-10-11（问题1）：**唯一定身份来源**是调用方显式传下来的 provider_id。
+        #   set_current_model 只是给历史代码留的兼容影子，不再参与选择提供商。
+        _pid = kwargs.get("provider_id") or ""
+        # ★ 2026-10-10：thinking / reasoning_effort 是思考类请求字段，接通用 OpenAI 兼容端点
+        #   （如本地 Ollama）时必须省掉，否则对方 400：「"qwen2.5:3b" does not support thinking」。
+        # ★ 2026-11-13：改成白名单 —— DeepSeek 与**七牛（qnaigc）**都支持 thinking；
+        #   reasoning_effort 的档位取值只有 DeepSeek 认（max/high/low），别家只发 thinking。
+        _use_think = provider_supports_thinking(_pid)
+        _is_ds = provider_is_deepseek(_pid)
+        _extra = provider_extra_body(thinking, _pid, r_eff)
         _basic = dict(model=model, messages=internal, tools=tools, stream=True)
-        if _use_ds:
-            _basic["reasoning_effort"] = r_eff
+        if _use_think:
             _basic["extra_body"] = _extra
+        if _is_ds:
+            _basic["reasoning_effort"] = r_eff
+        _cli = get_client_for_provider(_pid, model)
+
+        def _do_call(b):
+            try:
+                return _cli.chat.completions.create(
+                    stream_options={"include_usage": True}, **b)
+            except TypeError:
+                # 旧版 SDK 不支持 stream_options
+                return _cli.chat.completions.create(**b)
+
         try:
-            return get_client().chat.completions.create(
-                stream_options={"include_usage": True}, **_basic)
-        except TypeError:
-            # 旧版 SDK 不支持 stream_options
-            return get_client().chat.completions.create(**_basic)
+            return _do_call(_basic)
+        except Exception as _ce:
+            # ★ 2026-11-13（用户："默认发思考，对面不接受才不发"）：
+            #   带 thinking 被拒（400 之类）时，去掉思考参数重试一次，并把这个端点记进
+            #   黑名单 —— 之后同一端点不再发，不会每次白白多一次 400 往返。
+            if _use_think and _thinking_rejected(_ce):
+                mark_thinking_unsupported(_pid)
+                logging.warning(
+                    f"[LLM] {model} 不认 thinking 参数，该提供商后续不再发送（本次已去掉重试）：{str(_ce)[:160]}")
+                _b2 = {k: v for k, v in _basic.items() if k not in ('extra_body', 'reasoning_effort')}
+                return _do_call(_b2)
+            raise
 
     # 累计量在每个尝试内部重置（见下方循环开头）；此处声明供循环外返回路径使用
     full_reasoning = ""
@@ -6726,16 +8116,32 @@ def _llm_stream_call(internal, model, r_eff, thinking, tools, cancel_event, usag
 
             def _pump(r, qq=q, sent=_SENTINEL):
                 """单条流的读取线程：只在这里做阻塞读，把结果推入队列；
-                主线程据此做超时判断，从而能真正检测到“长时间无数据”。"""
+                主线程据此做超时判断，从而能真正检测到"长时间无数据"。
+
+                ★ 2026-11-11（问题3）：一律 put_nowait —— 读取线程的唯一职责是
+                  尽快把上游 socket 里的数据搬进内存，任何形式的等待都会让上游
+                  触发反压（TCP 窗口填满 → 服务端/API 侧变慢甚至 10054）。
+                  队列满就丢这一块，宁可少渲染几个 token 也不能卡住读取。
+                """
+                def _offer(obj):
+                    try:
+                        qq.put_nowait(obj)
+                    except queue.Full:
+                        pass
+                    except Exception:
+                        pass
                 try:
                     for _c in r:
-                        qq.put(_c)
+                        _offer(_c)
                 except BaseException as _e:      # noqa: BLE001
-                    qq.put(_e)
+                    _offer(_e)
                 finally:
-                    qq.put(sent)
+                    _offer(sent)
 
             stalled = False
+            # ★ 2026-11-13：流到一半上游断开时把异常存在这里，交给下面的重试分支
+            #   （以前直接 raise 到最外层，网络抖一下就整轮报错）。
+            _mid_stall_err = None
             # ★ 每次尝试都从零开始累计：卡死重试时本次未送出的累计量直接丢弃，
             #   否则“第 1 次已累计 + 第 2 次重新生成”会拼成重复/错乱的内容。
             full_reasoning = ""
@@ -6754,8 +8160,37 @@ def _llm_stream_call(internal, model, r_eff, thinking, tools, cancel_event, usag
             _last_chunk_at = None
             _out_start = None
             _out_end = None
+            # ★ 2026-11-12：首 token 也得按**本次尝试**的起点算。
+            #   _first_chunk_at 虽已归零，但外面统计用的是整个函数的 t_start，
+            #   一旦前面卡过一次重试，首 token 就会把「上次失败的等待」也算进来，
+            #   在会话属性里冒出 8 秒、十几秒的假数字。llm_ms 仍用 t_start（那是总耗时，合理）。
+            _attempt_t0 = time.time()
             try:
-                resp = _open_stream()
+                try:
+                    resp = _open_stream()
+                except Exception as _oe:
+                    # ★ 2026-11-13（用户要求）：不只 429，网络抖动/5xx/连接被重置也要重试。
+                    #   判断见 _is_retryable_llm_error：配置类错误（401/404/422…）不重试，
+                    #   暂时性错误按 _llm_retry_wait 退避后重试；429 优先听 Retry-After。
+                    if _is_retryable_llm_error(_oe) and _attempt < LLM_MAX_RETRIES:
+                        _w = _llm_retry_wait(_oe, _attempt)
+                        _why = "rate_limit" if _is_rate_limited(_oe) else "transient"
+                        logging.warning(f"[LLM] 调用失败（可重试/{_why}），{_w:.0f}s 后重试"
+                                        f"（第 {_attempt}/{LLM_MAX_RETRIES} 次）：{str(_oe)[:200]}")
+                        try:
+                            emit_evt({"type": "retrying", "reason": _why,
+                                      "wait": int(round(_w)), "attempt": _attempt,
+                                      "max": LLM_MAX_RETRIES})
+                        except Exception:
+                            pass
+                        # 退避期间必须仍然响应「停止」：分片睡，逐秒检查 cancel_event
+                        _deadline = time.time() + _w
+                        while time.time() < _deadline:
+                            if cancel_event.is_set():
+                                return None, "", "", [], True, None
+                            time.sleep(max(0.0, min(1.0, _deadline - time.time())))
+                        continue
+                    raise
                 it = iter(resp)
                 threading.Thread(target=_pump, args=(it,), daemon=True).start()
                 last_progress = time.time()
@@ -6787,25 +8222,53 @@ def _llm_stream_call(internal, model, r_eff, thinking, tools, cancel_event, usag
                     if chunk is _SENTINEL:
                         break
                     if isinstance(chunk, BaseException):
-                        raise chunk
+                        # ★ 2026-11-13：流中途异常（连接重置 / 提前 EOF / SSL 抖动）——
+                        #   按"卡死"处理，走下面的重试分支（会先发 reset_container，
+                        #   避免半截内容与重试内容拼接）。配置类错误照旧抛给上层。
+                        _mid_stall_err = chunk
+                        logging.warning(f"[LLM] 流中异常（第 {_attempt} 次尝试）：{str(chunk)[:200]}")
+                        stalled = True
+                        break
 
                     # ---- 正常分块处理（只补发新增内容，兼容重试） ----
                     if getattr(chunk, 'usage', None):
                         u = chunk.usage
-                        usage["prompt_tokens"] += u.prompt_tokens
-                        usage["completion_tokens"] += u.completion_tokens
-                        usage["total_tokens"] += u.total_tokens
-                        _cached = getattr(getattr(u, 'prompt_tokens_details', None), 'cached_tokens', 0)
-                        usage["cached_tokens"] += _cached
-                        # ★ 真实 usage：本次调用的输入 token 即当前上下文占用
-                        usage["ctx_tokens"] = u.prompt_tokens
+                        # ★ 2026-11-13（用户 5002 报「unsupported operand type(s) for +=: 'int' and 'NoneType'」）：
+                        #   七牛 api.qnaigc.com 的 conatus-free 等 OpenAI 兼容端点，流式最后一帧的
+                        #   usage 字段是 **null**（prompt_tokens=None），不是缺省也不是 0。
+                        #   直接 `+= u.prompt_tokens` 会抛 TypeError，整轮回答直接失败。
+                        #   这里统一 `or 0` 兜底；三个字段全空时干脆当成"没有 usage"跳过。
+                        _p_tok = int(getattr(u, 'prompt_tokens', 0) or 0)
+                        _c_tok = int(getattr(u, 'completion_tokens', 0) or 0)
+                        _t_tok = int(getattr(u, 'total_tokens', 0) or 0)
+                        _cached = int(getattr(getattr(u, 'prompt_tokens_details', None), 'cached_tokens', 0) or 0)
+                        # ★ 2026-11-13：带 usage 的那一帧常常同时带 finish_reason。
+                        #   必须在"全空就 continue"**之前**读，否则七牛这种 usage 全 null 的
+                        #   端点连 stop 都拿不到（实测 finish=None）。
+                        _fr = None
+                        try:
+                            if getattr(chunk, 'choices', None):
+                                _fr = chunk.choices[0].finish_reason
+                        except Exception:
+                            _fr = None
+                        if _fr:
+                            finish_reason = _fr
+                        if _p_tok == 0 and _c_tok == 0 and _t_tok == 0 and _cached == 0:
+                            continue
+                        usage["prompt_tokens"] = int(usage.get("prompt_tokens") or 0) + _p_tok
+                        usage["completion_tokens"] = int(usage.get("completion_tokens") or 0) + _c_tok
+                        usage["total_tokens"] = int(usage.get("total_tokens") or 0) + (_t_tok or (_p_tok + _c_tok))
+                        usage["cached_tokens"] = int(usage.get("cached_tokens") or 0) + _cached
+                        # ★ 真实 usage：本次调用的输入 token 即当前上下文占用（0 不可信，不覆盖）
+                        if _p_tok > 0:
+                            usage["ctx_tokens"] = _p_tok
                         # ★ 按模型分别累计（修复“中途 Pro→Flash 导致金额变少”）
                         if sid:
-                            _acc_model_usage(sid, model, u.prompt_tokens, _cached, u.completion_tokens)
+                            _acc_model_usage(sid, model, _p_tok, _cached, _c_tok)
                             with sessions_lock:
                                 _st = _sess_stats(sid)
                                 if _st is not None:
-                                    _st["output_tokens"] = int(_st.get("output_tokens") or 0) + int(u.completion_tokens or 0)
+                                    _st["output_tokens"] = int(_st.get("output_tokens") or 0) + _c_tok
                         continue
                     if not getattr(chunk, 'choices', None):
                         continue
@@ -6872,10 +8335,14 @@ def _llm_stream_call(internal, model, r_eff, thinking, tools, cancel_event, usag
             if not stalled:
                 break   # 正常结束
 
-            # ---- 流卡死：重试 ----
-            last_err = RuntimeError(f"流式响应 {LLM_STALL_TIMEOUT:.0f}s 无数据（疑似连接被中断）")
-            if _attempt >= LLM_MAX_RETRIES:
-                logging.error(f"[LLM] 已重试 {LLM_MAX_RETRIES} 次仍卡死，放弃本轮")
+            # ---- 流卡死 / 流中途断开：重试 ----
+            # 配置类错误（401/404/422…）重试无意义，直接抛给上层（界面会给出人话提示）
+            if _mid_stall_err is not None and not _is_retryable_llm_error(_mid_stall_err):
+                raise _mid_stall_err
+            last_err = _mid_stall_err or RuntimeError(
+                f"流式响应 {LLM_STALL_TIMEOUT:.0f}s 无数据（疑似连接被中断）")
+            if _attempt >= LLM_STALL_RETRIES:
+                logging.error(f"[LLM] 已重试 {LLM_STALL_RETRIES} 次仍卡死，放弃本轮")
                 break
             # ★ 重试会整段重新生成：先让界面重开一块，避免半截内容与重试内容拼接显示
             if full_reasoning or full_content or tool_calls_acc:
@@ -6885,6 +8352,12 @@ def _llm_stream_call(internal, model, r_eff, thinking, tools, cancel_event, usag
                     pass
             time.sleep(1.0)
             logging.warning(f"[LLM] 准备第 {_attempt + 1} 次重试（已重置本地累计量）")
+            # ★ 2026-11-13：让界面知道"服务端在重试"，别把这段静默当成卡死
+            try:
+                emit_evt({"type": "retrying", "reason": "stall", "wait": 1,
+                          "attempt": _attempt, "max": LLM_STALL_RETRIES})
+            except Exception:
+                pass
 
         if last_err is not None and not full_content and not tool_calls_acc:
             # 多次重试仍无任何产出：把错误交给上层（界面会提示），避免静默卡住
@@ -6905,7 +8378,7 @@ def _llm_stream_call(internal, model, r_eff, thinking, tools, cancel_event, usag
             _t_end = time.time()
             _acc_time_stat(sid, "llm_ms", (_t_end - t_start) * 1000.0)
             if _first_chunk_at is not None:
-                _acc_first_token(sid, (_first_chunk_at - t_start) * 1000.0)
+                _acc_first_token(sid, (_first_chunk_at - _attempt_t0) * 1000.0)
             if _out_start is not None and _out_end is not None and _out_end > _out_start:
                 with sessions_lock:
                     _st = _sess_stats(sid)
@@ -6937,7 +8410,10 @@ def _llm_stream_call(internal, model, r_eff, thinking, tools, cancel_event, usag
         # ★ FIX(2026-09-11 v2)：超限类错误静默返回（由上层自动裁剪重试，不向界面发提示）
         if ("maximum context length" in _em) or ("context_length_exceeded" in _em):
             return None, "", "", [], False, e
-        emit_evt({"type": "error", "content": _em})
+        # ★ 2026-11-11：界面上只显示人话（原始异常进日志），见 humanize_llm_error
+        logging.error(f"[LLM] 调用失败（provider={kwargs.get('provider_id') or '-'}, model={model}）: {_em}")
+        emit_evt({"type": "error",
+                  "content": humanize_llm_error(e, kwargs.get('provider_id'), model)})
         return None, "", "", [], False, e
 
 def _handle_parent_ask_user(tool_call, session_id, emit, cancel_event, internal):
@@ -7098,6 +8574,13 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
         if sess:
             sess['cancel_event'] = cancel_event
             sess['wait_event'] = wait_event
+            # ★ 2026-11-12：把**真正干活的线程**登记到会话上。
+            #   原来"父循环还在跑"只有 parent_running 这个布尔标记，线程万一
+            #   异常退出/没被拉起，标记仍是 True —— 事件流据此认为会话还活着，
+            #   于是每 15 秒发心跳、永远不发"会话已死"的通知，
+            #   界面表现就是"消息发出去了、一直没回复、连重连提示都没有"。
+            #   有了线程引用就能拿到真实存活状态（is_alive）。
+            sess['parent_thread'] = threading.current_thread()
             logging.info(f"[OPERATE] 会话 {session_id} 开始，绑定事件")
         else:
             _sess_missing = True
@@ -7112,6 +8595,24 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
     with sessions_lock:
         sess = sessions.get(session_id)
         settings = dict(sess.get("settings") or {}) if sess else {}
+        # ★ 问题1：本会话锁定的提供商（/chat 写入）。整个父循环只认它，
+        #   不再靠"模型名猜是哪一家"。
+        provider_id = (sess.get("provider_id") or "") if sess else ""
+        # ★ 2026-11-11（按用户要求）：操作模式的用户输入也要带上来源元数据，
+        #   所以会话上要记住是哪个客户端发起的（/chat 写入）。
+        client_ip = (sess.get("client_ip") or "") if sess else ""
+    logging.info(f"[OPERATE] {session_id} 本次会话提供商 provider_id={provider_id or '(未指定，按模型名解析)'}，模型={model}")
+
+    # ★ 2026-11-11（按用户要求）：与对话模式一致，操作模式的每条**用户真实输入**
+    #   前面都拼一段 `[时间: ...] [IP: ...]`，让模型知道"谁、什么时候说的"。
+    #   只加在 kind=="user" 上；定时通知 / 子代理回传 / 内部命令一律不加
+    #   （那些不是用户说的话，加了反而会让模型误判来源）。
+    #   注意：这段前缀只进模型上下文，**不进界面气泡**（前端渲染的是事件里的原始文本）。
+    def _user_meta():
+        try:
+            return f"[时间: {datetime.now().isoformat()}] [IP: {client_ip or 'unknown'}] "
+        except Exception:
+            return ""
     # ★ BUGFIX(2026-10-04)：服务端"等客户端回传命令结果"的超时，必须与客户端上限对齐。
     #
     #   问题（用户实测）：客户端 COMMAND_TIMEOUT=600s，而服务端这里硬编码只等 120s。
@@ -7314,7 +8815,7 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
             if _rs is not None:
                 _rs["final_answered"] = True    # 进入空闲，等用户下一条消息
     elif injected is not None:
-        internal = [{"role": "system", "content": agent_system}] + injected
+        internal = _with_system(agent_system, injected)
         logging.info(f"[OPERATE] {session_id} 使用导入上下文，消息数 {len(injected)}")
     elif rebuilt_history:
         # ★ 2026-10-03（按用户要求）：重建也走结构化 —— 与导入同一条路。
@@ -7323,16 +8824,16 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
         if isinstance(_last_content, list):
             _last_content = " ".join(str(p.get('text', '')) for p in _last_content if isinstance(p, dict))
         _cur_text = "" if _last_content is None else str(_last_content)
-        internal = [{"role": "system", "content": agent_system}] + rebuilt_history
+        internal = _with_system(agent_system, rebuilt_history)
         internal.append({"role": "user",
                          "content": _build_user_content_with_images(
-                             _file_ctx(initial_files) + _cur_text,
+                             _user_meta() + _file_ctx(initial_files) + _cur_text,
                              [{"data_url": u} for u in initial_images])})
         logging.info(f"[OPERATE] {session_id} 使用结构化重建上下文，历史 {len(rebuilt_history)} 条 + 当前 1 条")
     else:
-        _init_text = _file_ctx(initial_files) + user_content
-        internal = [{"role": "system", "content": agent_system},
-                    {"role": "user", "content": _build_user_content_with_images(_init_text, [{"data_url": u} for u in initial_images])}]
+        _init_text = _user_meta() + _file_ctx(initial_files) + user_content
+        internal = _with_system(agent_system, [
+                    {"role": "user", "content": _build_user_content_with_images(_init_text, [{"data_url": u} for u in initial_images])}])
 
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0, "ctx_tokens": 0}
     # ★ 2026-09-21：把 internal / usage 的引用挂到会话上，供「会话属性」面板读取
@@ -7400,7 +8901,7 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
             sess = sessions.get(session_id)
             if sess:
                 sess["command_events"].pop(task_id, None)
-        out = result_holder.get("output", "命令结果丢失") if result_holder else "命令结果丢失"
+        out = (result_holder.get("output") or _lost_cmd_result(time.time() - start_wait, task_id))
         ret = result_holder.get("returncode", -1) if result_holder else -1
         emit({"type": "command_result", "task_id": task_id, "command": show_cmd,
               "output": _event_view_image_output(show_cmd, out), "returncode": ret, "command_title": _cmd_title(show_cmd)})
@@ -7420,7 +8921,8 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
             kind = "agent_return" if kind != "user" else "user"
         # ★ 事件携带图片（供前端在用户气泡中渲染缩略图）；文档内容只注入模型上下文
         emit({"type": "user_message", "content": msg, "kind": kind})
-        text = _file_ctx(files or []) + msg
+        # ★ 2026-11-11：只有用户真实输入带元数据前缀（见 _user_meta 的说明）
+        text = (_user_meta() if kind == "user" else "") + _file_ctx(files or []) + msg
         internal.append({"role": "user", "content": _build_user_content_with_images(text, [{"data_url": u} for u in (images or [])])})
 
     try:
@@ -7439,9 +8941,15 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
                 new_model = (sess.get("model") or "") if sess else ""
                 new_r_eff = (sess.get("reasoning_effort") or "") if sess else ""
                 new_think = sess.get("thinking_enabled") if sess else None
+                # ★ 问题1：提供商也每轮刷新 —— 用户中途切到另一家的同名模型时，
+                #   model 名可能一字不差，只有 provider_id 变了，所以它必须单独比较。
+                new_pid = (sess.get("provider_id") or "") if sess else ""
             if new_model and new_model != model:
                 model = new_model
                 logging.info(f"[OPERATE] {session_id} 模型已刷新为 {model}")
+            if new_pid and new_pid != provider_id:
+                provider_id = new_pid
+                logging.info(f"[OPERATE] {session_id} 提供商已刷新为 {provider_id}")
             # ★ FIX(2026-09-11 v4)：思考强度/思考开关同样每轮刷新（中途切换即时生效）
             if new_r_eff and new_r_eff != r_eff:
                 r_eff = new_r_eff
@@ -7506,7 +9014,15 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
             if user_msgs:
                 logging.info(f"[OPERATE] {session_id} 处理用户消息 {len(user_msgs)} 条，发送 reset_container 事件")
                 _bad_tool_retry = 0   # ★ 新的一轮用户消息：重置“错误工具名”重试计数
-                emit({"type": "reset_container"})
+                # ★ BUGFIX(2026-11-11, 问题4「导入回放气泡顺序错乱」)：
+                #   reset_container 语义是"新开一块给这一轮的内容用"，它必须排在
+                #   user_message **之后**。原来先发 reset_container 再发 user_message：
+                #     · 实时流：气泡是发送时前端自己画的，认领机制把它复用，看不出问题；
+                #     · 导出/导入回放：事件按录制顺序重放 —— 白框先建好，工具/思考块全写进去，
+                #       用户气泡最后才插到消息区末尾 → "模型的思考/工具框跑到了提问上方"。
+                #   现在改成：先把本轮所有用户消息 emit 完（send_user_message 内部发
+                #   user_message），再发 reset_container，最后才进入模型调用 ——
+                #   实时流与回放两条路径的顺序同时正确。
                 # ★ 兜底：复用会话时随 /chat 传入的图片/文档（pending_*）附加到本轮消息
                 with sessions_lock:
                     _ss = sessions.get(session_id)
@@ -7546,6 +9062,8 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
                             emit({"type": "error", "content": out})
                         continue
                     send_user_message(msg, "user", msg_images, msg_files)
+                # ★ 问题4：本轮用户消息全部发完，再请求"新容器边界"（顺序见上方说明）。
+                emit({"type": "reset_container"})
                 with sessions_lock:
                     if sess:
                         sess['final_answered'] = False
@@ -7642,11 +9160,12 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
 
             # 调用大模型（流式输出）
             try:
-                logging.info(f"[OPERATE] {session_id} 调用大模型（流式），模型: {model}，思考强度: {r_eff}，思考开关: {thinking}，当前消息数: {len(internal)}")
+                logging.info(f"[OPERATE] {session_id} 调用大模型（流式），提供商: {provider_id or '-'}，模型: {model}，"
+                             f"思考强度: {r_eff}，思考开关: {thinking}，当前消息数: {len(internal)}")
                 last_call_ts = time.time()   # ★ 用量计价以本次调用时间为准（峰谷定价）
                 finish_reason, full_reasoning, full_content, tool_calls, cancelled, err = _llm_stream_call(
                     internal, model, r_eff, thinking, tools, cancel_event, usage, emit,
-                    sid=session_id, t_start=last_call_ts)
+                    sid=session_id, t_start=last_call_ts, provider_id=provider_id)
 
                 if cancelled:
                     break
@@ -7865,7 +9384,7 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
                             emit({"type": "cancelled"})
                             break
 
-                        out = result_holder.get("output", "命令结果丢失") if result_holder else "命令结果丢失"
+                        out = (result_holder.get("output") or _lost_cmd_result(time.time() - start_wait, task_id))
                         ret = result_holder.get("returncode", -1) if result_holder else -1
                         emit({"type": "command_result", "task_id": task_id, "command": cmd_str, "output": _event_view_image_output(cmd_str, out), "returncode": ret,
                               "command_title": _cmd_title(cmd_str)})
@@ -7920,21 +9439,41 @@ def run_parent_loop(msgs, model, r_eff, thinking, session_id, resume_internal=No
                     #   导致操作模式下模型在后续轮次看不到自己之前的回答）。
                     internal.append({"role": "assistant", "content": answer})
                     # ★ 用量合计(2026-09-06)：子代理（spawn_agent）的 token 用量也计入总量。
+                    # ★ 2026-11-13（用户：同一个会话白框 3.93 元、会话属性 0.71 元，听谁的）：
+                    #   旧写法每轮都把 children_usage / hist_usage 的**全量**再加一遍到本轮事件上，
+                    #   而 children_usage 本身是"整个会话的子代理累计"。于是子代理用得越多、父循环
+                    #   产出 final_answer 的轮数越多，前端「累计输入」就被加得越离谱（实测同一会话
+                    #   面板 368 万 token / ¥0.71，白框 4522 万 token / ¥3.93，差 12 倍）。
+                    #   改成**增量并入**：只把尚未计入的部分加进 usage（并写回 usage_ref 持久），
+                    #   已计入量记在 sess["usage_counted"]，重复进入本分支不会再叠加。
+                    _delta = {}
                     with sessions_lock:
                         _psess = sessions.get(session_id)
                         _extra = dict((_psess or {}).get("children_usage") or {})
                         # ★ 2026-09-21：导入会话带上历史用量基数，否则“导出→导入→再发一条消息”
-                    #   时，界面外部用量会从很小的本次值重新开始，看起来像“用量变少了”。
-                    #   这里只在**导入过历史用量**时才加基数（新会话基数为 0，行为不变）。
-                    _base = dict((_psess or {}).get("stats", {}).get("hist_usage") or {}) \
-                        if isinstance((_psess or {}).get("stats"), dict) else {}
-                    _usage_evt = dict(usage)
-                    for _k in ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens"):
-                        _usage_evt[_k] = int(_usage_evt.get(_k, 0) or 0) + int(_extra.get(_k, 0) or 0)
-                    if _base:
+                        #   时，界面外部用量会从很小的本次值重新开始，看起来像“用量变少了”。
+                        #   只在**导入过历史用量**时才加基数（新会话基数为 0，行为不变）。
+                        _base = dict((_psess or {}).get("stats", {}).get("hist_usage") or {}) \
+                            if isinstance((_psess or {}).get("stats"), dict) else {}
+                        _counted = dict((_psess or {}).get("usage_counted") or {})
                         for _k in ("prompt_tokens", "completion_tokens", "cached_tokens"):
-                            _usage_evt[_k] = int(_usage_evt.get(_k, 0) or 0) + int(_base.get(_k, 0) or 0)
-                        _usage_evt["total_tokens"] = int(_usage_evt.get("prompt_tokens", 0)) + int(_usage_evt.get("completion_tokens", 0))
+                            _target = int(_extra.get(_k, 0) or 0) + int(_base.get(_k, 0) or 0)
+                            _done = int(_counted.get(_k, 0) or 0)
+                            if _k == "cached_tokens":
+                                # 缓存命中量可能因上游口径波动小幅回落，按"不超过输入"取大值即可
+                                _target = min(_target, int(_extra.get("prompt_tokens", 0) or 0)
+                                              + int(_base.get("prompt_tokens", 0) or 0))
+                            if _target > _done:
+                                _delta[_k] = _target - _done
+                                _counted[_k] = _target
+                        if _delta and _psess is not None:
+                            _psess["usage_counted"] = _counted
+                    for _k, _v in _delta.items():
+                        usage[_k] = int(usage.get(_k, 0) or 0) + _v
+                    if _delta:
+                        usage["total_tokens"] = int(usage.get("prompt_tokens", 0) or 0) \
+                            + int(usage.get("completion_tokens", 0) or 0)
+                    _usage_evt = dict(usage)
                     emit({"type": "final_answer", "content": answer})
                     emit({"type": "usage", "usage": _usage_evt, "ts": last_call_ts})
                     with sessions_lock:
@@ -8052,11 +9591,10 @@ def child_agent_stream(a):
             _agent_set_status(a, "killed")
             emit({"type": "agent_cancelled"})
 
-    internal = [
+    internal = _with_system(_effective_child_base(), [
         # ★ 2026-09-21：子 Agent 基础提示词支持在“提示词”标签页里单独覆盖（child_base）
-        {"role": "system", "content": _effective_child_base()},
         {"role": "user", "content": a["task"]},
-    ]
+    ])
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0, "ctx_tokens": 0}
 
     def wait_client(cmd_str, display=None, orig_args=None):
@@ -8095,7 +9633,7 @@ def child_agent_stream(a):
         with agents_lock:
             if aid in agents:
                 a["command_events"].pop(task_id, None)
-        out = result_holder.get("output", "命令结果丢失") if result_holder else "命令结果丢失"
+        out = (result_holder.get("output") or _lost_cmd_result(time.time() - start_wait, task_id))
         ret = result_holder.get("returncode", -1) if result_holder else -1
         emit({"type": "command_result", "task_id": task_id, "command": show_cmd,
               "output": _event_view_image_output(show_cmd, out), "returncode": ret, "command_title": _cmd_title(show_cmd)})
@@ -8192,7 +9730,7 @@ def child_agent_stream(a):
                 finish_reason, full_reasoning, full_content, tool_calls, cancelled, err = _llm_stream_call(
                     internal, a["model"], a["reasoning_effort"], a.get("thinking_enabled", True),
                     CHILD_TOOLS, cancel_event, usage, emit,
-                    sid=sid, t_start=_child_call_t0)
+                    sid=sid, t_start=_child_call_t0, provider_id=a.get("provider_id") or "")
 
                 if cancelled:
                     # ★ BUGFIX(2026-08-15) 取消发生于 LLM 流式调用中途时，
@@ -8368,7 +9906,7 @@ def child_agent_stream(a):
                             announce_killed()
                             break
 
-                        out = result_holder.get("output", "命令结果丢失") if result_holder else "命令结果丢失"
+                        out = (result_holder.get("output") or _lost_cmd_result(time.time() - start_wait, task_id))
                         ret = result_holder.get("returncode", -1) if result_holder else -1
                         emit({"type": "command_result", "task_id": task_id, "command": cmd_str, "output": _event_view_image_output(cmd_str, out), "returncode": ret,
                               "command_title": _cmd_title(cmd_str)})
@@ -8450,9 +9988,126 @@ cancelled_nodes = set()
 cancelled_nodes_lock = threading.Lock()
 
 
-def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input):
+def _retry_reason_text(err):
+    """把一次可重试的错误归成一句人话（用于界面上的重试提示）。"""
+    s = str(err).lower()
+    if '429' in s or 'rate limit' in s or 'too many request' in s or '请求过于频繁' in s:
+        return '服务商限流（429）'
+    if 'timeout' in s or 'timed out' in s or '超时' in s:
+        return '请求超时'
+    if any(w in s for w in ('connection', 'reset', 'eof', 'ssl', 'network',
+                            '10054', '10053', 'aborted', '断开', '连接')):
+        return '网络连接中断'
+    if any(w in s for w in ('500', '502', '503', '504', 'internal server', 'bad gateway')):
+        return '服务商暂时不可用'
+    return '请求失败'
+
+
+def _retry_reason_key(err):
+    """与 _retry_reason_text 对应的机器可读分类（前端按它选措辞/颜色）。"""
+    s = str(err).lower()
+    if '429' in s or 'rate limit' in s or 'too many request' in s or '请求过于频繁' in s:
+        return 'rate_limit'
+    if 'timeout' in s or 'timed out' in s or '超时' in s:
+        return 'timeout'
+    if any(w in s for w in ('connection', 'reset', 'eof', 'ssl', 'network',
+                            '10054', '10053', 'aborted', '断开', '连接')):
+        return 'network'
+    return 'upstream'
+
+
+def _open_chat_stream_with_retry(provider_id, model, msgs, r_eff, extra, nid=None):
+    """对话模式建立事件流，对「值得重试」的错误按设置重试。
+
+    ★ 2026-11-13（用户："对话模式有这个重试吗，对话模式设置里没找到"）：
+      原来对话模式直接 create，429 / 网络抖动一次就整条失败；只有操作模式有重试。
+      现在两边共用同一份 `_RETRY_KNOBS`（操作模式设置里的「🔁 重试与容错」，
+      也可以在「对话模式设置 → 🔁 重试」里改）。
+
+    覆盖范围：**建立流**这一步（429 限流、5xx、连接重置、超时都在这里抛）。
+    流已经建立后的中途断流仍按原逻辑报错 —— 因为已写进节点的半截内容不好回收，
+    硬重来会让用户看到内容"跳一下"。
+    """
+    _max_tries = max(1, int(_RETRY_KNOBS.get("max_retries") or 15))
+    _attempt = 0
+    while True:
+        _attempt += 1
+        try:
+            return get_client_for_provider(provider_id, model).chat.completions.create(
+                model=model, messages=msgs, stream=True,
+                **({"reasoning_effort": r_eff, "extra_body": extra}
+                   if provider_supports_thinking(provider_id) else {}),
+                timeout=90)
+        except Exception as _e:
+            # ★ 2026-11-13：带 thinking / budget_tokens 被拒（400）→ 去掉思考参数**立刻**再来一次，
+            #   并把这个端点记进黑名单（本进程内不再发），免得每轮都白付一次 400。
+            #   与操作模式的 _llm_stream_call 保持同一套兜底。
+            if extra is not None and _thinking_rejected(_e):
+                mark_thinking_unsupported(provider_id)
+                logging.warning(f"[CHAT] {model} 不认 thinking 参数，去掉后重试：{str(_e)[:160]}")
+                extra = None
+                if nid:
+                    try:
+                        update_node_in_tree(nid, retryTip=None)
+                    except Exception:
+                        pass
+                continue
+            if _attempt >= _max_tries or not _is_retryable_llm_error(_e):
+                raise
+            _w = _llm_retry_wait(_e, _attempt)
+            logging.warning(f"[CHAT] 建立流失败（{_retry_reason_text(_e)}），"
+                            f"{_w:.0f}s 后重试（第 {_attempt}/{_max_tries} 次）：{str(_e)[:150]}")
+            if nid:
+                # ★ 2026-11-13（用户："怎么不是那个橙色气泡，而是直接在框里显示"）：
+                #   提示不能写进 assistantMessage —— 那是**回答正文**，会变成"框里一行字"
+                #   且下一次重试就被清空、前端轮询还容易错过。
+                #   改成节点上的独立字段 retryTip，前端渲染成橙色胶囊并逐次更新。
+                try:
+                    update_node_in_tree(nid, retryTip={
+                        'reason': _retry_reason_key(_e),
+                        'wait': int(round(_w)),
+                        'attempt': _attempt,
+                        'max': _max_tries,
+                        'ts': time.time(),
+                    })
+                except Exception:
+                    pass
+            _dl = time.time() + _w
+            _stopped = False
+            while time.time() < _dl:
+                with cancelled_nodes_lock:
+                    if nid and nid in cancelled_nodes:
+                        cancelled_nodes.discard(nid)
+                        _stopped = True
+                        break
+                time.sleep(max(0.0, min(1.0, _dl - time.time())))
+            if nid:
+                try:
+                    update_node_in_tree(nid, retryTip=None)
+                except Exception:
+                    pass
+            if _stopped:
+                raise RuntimeError('用户已停止生成')
+
+
+def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input, provider_id=None):
     # ★ 2026-10-14（多提供商）：声明本次调用所用模型（决定 base_url / api_key）
+    # ★ 2026-11-11（问题1）：改为**显式**按 provider_id 取客户端 —— 这是本线程内，
+    #   contextvar 其实可用，但为了"只有一条通路"（不给自己留第二种解析方式），
+    #   统一走 get_client_for_provider()。
     set_current_model(model)
+    # ★ 2026-11-13（用户："怎么又没有思考了"）：把本次**实际发出**的思考参数打进日志。
+    #   "明明能思考却没思考"看这一行就能分清两种原因：
+    #     ① think=off / supports_thinking=False → 我们根本没请求（档位拖到 Off、或端点被拉黑）
+    #     ② think=on 但 reasoning 仍是 0 字      → 请求发了，是上游没给（限流降级 / 融合模型路由）
+    try:
+        logging.info(
+            f"[CHAT] {nid} 开始 model={model} provider={provider_id} "
+            f"think={'on' if ((extra or {}).get('thinking') or {}).get('type') == 'enabled' else 'off'} "
+            f"extra_body={extra} effort={r_eff} "
+            f"supports_thinking={provider_supports_thinking(provider_id)}")
+    except Exception:
+        pass
     full_content = ""
     full_reasoning = ""
     reasoning_start = time.time()
@@ -8464,13 +10119,8 @@ def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input):
     _finish_reason = None
     _stop_reason = None
     try:
-        stream = get_client().chat.completions.create(
-            model=model, messages=msgs, stream=True,
-            # ★ 2026-10-10：DeepSeek 专有字段按端点能力发送（见 provider_supports_thinking）。
-            **({"reasoning_effort": r_eff, "extra_body": extra}
-               if provider_supports_thinking() else {}),
-            timeout=90
-        )
+        # ★ 2026-11-13：建立流这一步走重试（429 / 5xx / 网络抖动），详见该函数说明。
+        stream = _open_chat_stream_with_retry(provider_id, model, msgs, r_eff, extra, nid=nid)
         for chunk in stream:
             # ★ 2026-10-05：用户点了「停止生成」→ 立刻收工（不再往节点里写。
             #   否则界面停了、服务端还在不停 update_node_in_tree，既浪费 token
@@ -8514,7 +10164,7 @@ def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input):
         if full_content and not _user_stopped:
             try:
                 tp = f"请为以下对话内容生成一个简短的标题（4-10字），只输出标题。\n用户：{user_input}\n助手：{full_content}"
-                tr = get_client().chat.completions.create(model=model, messages=[{"role": "user", "content": tp}], stream=False, reasoning_effort='low')
+                tr = get_client_for_provider(provider_id, model).chat.completions.create(model=model, messages=[{"role": "user", "content": tp}], stream=False, reasoning_effort='low')
                 title = tr.choices[0].message.content.strip()[:20]
             except: pass
         update_node_in_tree(nid, title=title)
@@ -8530,7 +10180,11 @@ def _generate_chat_background(nid, msgs, model, r_eff, extra, user_input):
         except Exception:
             pass
         _stop_reason = 'error'
-        update_node_in_tree(nid, assistantMessage=f"[生成失败: {str(e)}]")
+        # ★ 2026-11-11（按用户要求）：不再把 Python 字典糊到气泡里。
+        #   有半截正文就保留，只在末尾接一段人话说明；否则整条替换成提示。
+        _hint = humanize_llm_error(e, provider_id, model)
+        _shown = (full_content.rstrip() + "\n\n" + _hint) if (full_content or "").strip() else _hint
+        update_node_in_tree(nid, assistantMessage=_shown)
     finally:
         # ★ 2026-10-23：把"为什么没有回答"写进节点，并在服务端留一行可查的日志。
         #   现象：用户只看到思考断了半句、下面全空，无法判断是被停止还是出了故障。
@@ -8584,6 +10238,11 @@ def _operation_stream_response(sid, messages, model, r_eff, think, session_extra
                 # 抢占消费者身份：把旧消费者（如果有）作废
                 _my_token = object()
                 _s["stream_token"] = _my_token
+                # ★ 2026-11-11（问题8）：显式标记"现在有没有浏览器连接在收事件"。
+                #   注意这只是**观测状态**，父循环绝不看它决定要不要继续跑
+                #   （切后台/断网 10 分钟后回来，任务照样得继续，见下面的 finally）。
+                _s["stream_connected"] = True
+                _s["stream_connected_at"] = time.time()
                 q = _s.get("event_queue")
             if q is None:
                 return
@@ -8655,7 +10314,45 @@ def _operation_stream_response(sid, messages, model, r_eff, think, session_extra
                         except Exception:
                             pass
                         return
-                    yield json.dumps({"type": "heartbeat", "agent_id": "main"}, ensure_ascii=False) + "\n"
+                    # ★ 2026-11-12（治「界面一直不出东西、又没有任何提示」）：
+                    #   心跳原来只带 type，前端只能推断"连接还活着"，无法判断
+                    #   "这一轮到底卡在哪"。而心跳每 15 秒一次，会把前端的
+                    #   「150 秒没有数据」看门狗一直喂饱 —— 服务端父循环哪怕早就
+                    #   停止产出（卡在等工具回传 / 模型调用挂住 / 循环异常退出但
+                    #   parent_running 没复位），界面也是一片安静，用户完全无从下手。
+                    #   现在把服务端侧的状态一起捎出去，前端能据此显示"卡在哪一步"。
+                    _hb = {"type": "heartbeat", "agent_id": "main"}
+                    _pt_alive = True          # 没有线程引用时按"活着"处理，别误报
+                    if _s is not None:
+                        try:
+                            _pt = _s.get("parent_thread")
+                            _pt_alive = True if _pt is None else bool(_pt.is_alive())
+                            _hb.update({
+                                "busy": bool(_s.get("busy")),
+                                "parent_running": bool(_s.get("parent_running")),
+                                "parent_exited": bool(_s.get("parent_exited")),
+                                "parent_thread_alive": _pt_alive,
+                                "children": int(_s.get("live_children", 0) or 0),
+                                "queued": int(q.qsize()) if hasattr(q, "qsize") else -1,
+                            })
+                        except Exception:
+                            pass
+                    # ★ 2026-11-12：僵尸会话兜底 —— 会话还标记"父循环在跑"，
+                    #   但真正干活的线程早就没了、也没有子代理、队列空、不是刚点过停止。
+                    #   这种状态下事件流会一直发心跳陪着干等（前端永远不会报错），
+                    #   正是用户说的「发了消息、模型没回复、连重连提示都没有」。
+                    #   这里直接给一条明确的错误事件并关流，让界面说话。
+                    if (_s is not None and not _pt_alive
+                            and not _s.get("busy") and not _s.get("live_children")
+                            and q.empty() and _stopped_ago >= 600):
+                        logging.warning(f"[OPERATE] {sid} 父循环线程已退出但 parent_running 仍为真"
+                                        f"（僵尸会话）→ 通知前端重发")
+                        yield json.dumps({"type": "error", "code": "parent_dead",
+                                          "content": "⚠️ 服务端这一轮的处理线程已经退出（会话残留），"
+                                                     "不会再产出内容。请重新发送这条消息。"},
+                                         ensure_ascii=False) + "\n"
+                        return
+                    yield json.dumps(_hb, ensure_ascii=False) + "\n"
                     continue
                 if evt is None:
                     # ★ 2026-10-05（修「停止后重连的流 8 毫秒就断」的真根因）：
@@ -8690,14 +10387,35 @@ def _operation_stream_response(sid, messages, model, r_eff, think, session_extra
                 _s = sessions.get(sid)
                 if _s is not None and _s.get("stream_token") is _my_token:
                     _s["stream_token"] = None
+                    _s["stream_connected"] = False      # ★ 只是观测标记，不影响父循环
+                    _s["stream_disconnected_at"] = time.time()
             logging.info(f"[OPERATE] {sid} 事件流连接结束（会话保留，等待重连或下一条消息）")
     return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
+
+def _ndjson_event(evt):
+    """只回一条事件的 NDJSON 流。
+
+    ★ 2026-11-12：/chat 里凡是"前端一定会按流来读"的分支，都**不能**回 jsonify ——
+      前端拿到一行没有 type 字段的 JSON 会既不渲染也不更新时间戳，
+      最后白等 150 秒才报"服务器长时间没有返回数据"（这个坑 2026-09-28 踩过一次）。
+      所以错误也要用流回，并且带上 type/code，前端才好分支处理。
+    """
+    def gen():
+        yield json.dumps(evt, ensure_ascii=False) + "\n"
+    return Response(stream_with_context(gen()), mimetype="application/x-ndjson")
 
 @app.route('/chat', methods=['POST'])
 def chat():
     d = request.get_json()
     mode = d.get('mode','chat')
     model = d.get('model') or default_model_name()
+    # ★ 2026-11-11（问题1）：提供商身份随请求一起上来，全程只认它。
+    #   前端从模型下拉的 dataset.providerId 取（见 index.html selectedProviderId）。
+    provider_id = str(d.get('provider_id') or '').strip()
+    if provider_id and get_provider_by_id(provider_id) is None:
+        # 配置被删/改过：不静默回退到"第一家"（那会扣错钱），直接拒绝并说明
+        logging.warning(f"[CHAT] 请求携带的 provider_id={provider_id} 不存在，拒绝本次调用")
+        return jsonify({"error": f"所选模型的提供商已不存在（{provider_id}），请在设置里重新选择模型"}), 400
     r_eff = d.get('reasoning_effort','max')
     think = d.get('thinking_enabled', True)
     tree_node_id = d.get('tree_node_id')
@@ -8709,10 +10427,24 @@ def chat():
     # === 操作模式 ===
     if mode == 'operation':
         messages = d.get('messages',[])
+        # ★ 2026-11-11（按用户要求）：用户输入的元数据要带客户端 IP，先记在这一层
+        #   （父循环跑在线程里，拿不到 request，只能由会话携带）。
+        _client_ip = (request.remote_addr or "").strip()
         if not messages or messages[0].get('role')!='system':
-            messages.insert(0,{"role":"system","content":SYSTEM_PROMPT})
+            # ★ 2026-11-12：原来这里塞的是**对话模式**的内置 SYSTEM_PROMPT（跨模式污染），
+            #   而且用户把提示词全部关掉后仍会硬塞一段，与“可读可写”冲突。
+            #   改用操作模式自己的拼装结果，为空就完全不插
+            #   （父循环会用 build_agent_system 再算一次，内容一致）。
+            _sys0 = build_agent_system(d.get('settings') or {})
+            if _sys0:
+                messages.insert(0, {"role": "system", "content": _sys0})
         # ★ 操作模式设置（工具开关/超时/截断/记忆列表上限等，来自前端设置弹窗）
         op_settings = d.get('settings') or {}
+        # ★ 2026-11-13：顺手刷新「服务端→提供商」的重试参数（父子循环都读这一份）
+        try:
+            _apply_retry_knobs(op_settings)
+        except Exception:
+            pass
 
         # ★ 操作模式支持随消息附带图片与文档（与对话模式一致，无模型能力假设）
         op_images = [img.get('data_url') for img in (d.get('images') or [])
@@ -8744,14 +10476,19 @@ def chat():
                     _rs["model"] = model
                     _rs["reasoning_effort"] = r_eff
                     _rs["thinking_enabled"] = think
+                    if provider_id:
+                        _rs["provider_id"] = provider_id   # ★ 问题1：重连也同步提供商
                     _ro = True
             if _ro:
                 logging.info(f"[OPERATE] {existing_sid} 纯重连（只接管事件流，不提交消息）")
                 return _operation_stream_response(existing_sid, messages, model, r_eff, think,
-                                                  session_extra={"model": model},
+                                                  session_extra={"model": model, "provider_id": provider_id},
                                                   start_parent=False)
-            logging.info(f"[OPERATE] {existing_sid} 纯重连：会话已不存在，忽略本次重连")
-            return jsonify({"status": "no_session"})
+            logging.warning(f"[OPERATE] {existing_sid} 纯重连：会话已不存在"
+                            f"（服务端重启过，或上次请求没送达）→ 通知前端重发")
+            return _ndjson_event({"type": "error", "code": "no_session",
+                                  "content": "⚠️ 服务端已没有这个会话（可能重启过，或上次消息没送达）。"
+                                             "请重新发送这条消息。"})
         if existing_sid:
             reconnect = False
             start_parent = False
@@ -8760,8 +10497,14 @@ def chat():
                 if sess:
                     if op_settings:
                         sess["settings"] = op_settings
+                    # ★ 2026-11-11：客户端可能换了（多机同时用），IP 跟着请求走
+                    if _client_ip:
+                        sess["client_ip"] = _client_ip
                     # ★ FIX(2026-09-11)：前端模型选择随请求同步，避免会话继续沿用旧模型
                     sess["model"] = model
+                    # ★ 问题1：提供商同样随请求同步（否则换了模型仍在用旧 provider 的 Key）
+                    if provider_id:
+                        sess["provider_id"] = provider_id
                     # ★ FIX(2026-09-11 v4)：思考强度/思考开关也随请求同步
                     sess["reasoning_effort"] = r_eff
                     sess["thinking_enabled"] = think
@@ -8785,12 +10528,26 @@ def chat():
                 logging.info(f"[OPERATE] {existing_sid} /chat 重连到已有会话"
                              f"（{'启动父循环' if start_parent else '父循环已在运行'}）")
                 return _operation_stream_response(existing_sid, messages, model, r_eff, think,
-                                                  session_extra={"model": model},
+                                                  session_extra={"model": model, "provider_id": provider_id},
                                                   start_parent=start_parent)
 
         # 新建会话：父 agent 与全部子 agent 共用同一个事件队列（同一条 HTTP 连接）
+        # ★ 2026-11-12（治「操作模式里消息发出去了、模型却不回复」）：
+        #   会话 id 现在允许**前端先定**（client_session_id）。
+        #   原来 id 只能由服务端生成、再靠流里的 session 事件告诉前端；
+        #   生产服上「前端→服务端」这条 POST 长连接一旦在收到 session 事件**之前**断掉，
+        #   前端手里就没有 session_id，自动重连的判据 `!!operationSessionId` 不成立 →
+        #   直接放弃（连 5 次重试都不会做）。而服务端这边会话已建、父循环在跑、
+        #   回答也照常生成进队列，却再没有任何连接来取 —— 界面表现就是"发了没回复"。
+        #   改成前端先给 id，断了也能拿同一个 id 接回队列（走 reconnect_only）。
         sid = str(uuid.uuid4())
+        _csid = str(d.get('client_session_id') or '').strip()[:64]
         with sessions_lock:
+            if _csid and _csid not in sessions:
+                sid = _csid
+                logging.info(f"[OPERATE] 采用前端预留的会话 id {sid}")
+            elif _csid:
+                logging.warning(f"[OPERATE] 前端预留 id {_csid} 已存在 → 改用新 id {sid}")
             sessions[sid] = {
                 "cancel_event": threading.Event(),
                 "msg_queue": [],   # ★ 统一消息队列（kind 区分用户消息/通知，want_idle 区分插话/排队）
@@ -8803,15 +10560,21 @@ def chat():
                 "live_children": 0,
                 "drain_event": threading.Event(),
                 "model": model,
+                "provider_id": provider_id,   # ★ 问题1：本会话锁定的提供商（父/子 agent 共用）
                 "reasoning_effort": r_eff,
                 "thinking_enabled": think,
                 "stream_started": True,
                 "settings": op_settings,
                 "initial_images": op_images,   # ★ 初始消息附带的图片（data_url 列表）
                 "initial_files": op_files,     # ★ 初始消息附带的文档（name+content）
+                # ★ 2026-11-11：本会话对应的对话树节点（前端当前选中的那个）。
+                #   仅供 session_config 的 set_title 改标题用；操作模式本身不建节点。
+                "tree_node_id": (d.get("tree_node_id") or ""),
+                # ★ 2026-11-11：用户输入的元数据 [IP: ...] 用（父循环线程拿不到 request）
+                "client_ip": _client_ip,
             }
         return _operation_stream_response(sid, messages, model, r_eff, think,
-                                          session_extra={"model": model})
+                                          session_extra={"model": model, "provider_id": provider_id})
 
     # === 树状对话模式（chat） ===
     images = d.get('images') or []
@@ -8822,10 +10585,16 @@ def chat():
     # ★ 2026-10-14（多提供商）：extra 由 provider_extra_body() 决定，
     #   而它内部依赖"当前端点是否支持 DeepSeek 专有字段" —— 必须先声明模型，
     #   否则会用错提供商的判定。
+    # ★ 2026-11-11（问题1）：现在直接按 provider_id 判定，不再依赖 contextvar
+    #   （本函数在线程里跑，contextvar 传不进来）。
     set_current_model(actual_model)
 
-    extra = provider_extra_body(think)
+    extra = provider_extra_body(think, provider_id, r_eff)
     new_id = create_node_in_tree(parent_id, sibling_id, user_input, "", "生成中...", "", actual_model, r_eff, True)
+    if provider_id:
+        # ★ 2026-11-11：把提供商也记进节点 —— 界面显示别名时按 (提供商, 模型名) 查，
+        #   否则同名模型必然显示成另一家的别名（用户实测：选 flash 显示 flash1）。
+        update_node_in_tree(new_id, providerId=provider_id)
     # ★ 图片落盘到 uploads（供历史记录回放与界面缩略图），节点只存 {name, file, mime} 元数据
     saved_images = _save_inline_images(images)
     if saved_images:
@@ -8856,9 +10625,13 @@ def chat():
     text_content = meta + file_ctx + user_input
     ctx.append({"role": "user", "content": _build_user_content_with_images(text_content, [{"data_url": i['data_url']} for i in images])})
     if not ctx or ctx[0].get('role')!='system':
-        ctx.insert(0,{"role":"system","content":_effective_chat_system()})
-    threading.Thread(target=_generate_chat_background, args=(new_id, ctx, actual_model, r_eff, extra, user_input), daemon=True).start()
-    return jsonify({"nodeId": new_id, "generating": True, "model": actual_model})
+        # ★ 2026-11-12：提示词被用户全部关掉时不插空 system 消息。
+        _sm0 = _sys_message(_effective_chat_system())
+        if _sm0:
+            ctx.insert(0, _sm0)
+    threading.Thread(target=_generate_chat_background, args=(new_id, ctx, actual_model, r_eff, extra, user_input, provider_id), daemon=True).start()
+    return jsonify({"nodeId": new_id, "generating": True, "model": actual_model,
+                    "provider_id": provider_id})
 
 # ★ 2026-10-05：对话模式的「停止生成」入口（见 cancelled_nodes 的说明）。
 @app.route('/api/cancel_node', methods=['POST'])
@@ -8960,6 +10733,41 @@ def get_client_components():
         }
     return jsonify(result)
 
+# ★ 2026-11-11（问题9「网页端打包组件丢失」）：
+#   每个组件"装出来必须有的关键文件"。以前 /api/build-client-zip 只管把匹配到的
+#   条目塞进新 zip，匹配不到就**静默跳过**；只有"所有组件全都匹配不到"才报错。
+#   于是用户勾了 agent.py + python，解压出来没有 pip（甚至可能是个空壳），
+#   界面还提示打包成功 —— 没有任何线索。
+#   现在逐个组件校验，缺东西就**明确列出来并拒绝打包**。
+COMPONENT_REQUIRED = {
+    "agent_py": [
+        "client/agent.py",
+        "client/run.bat",
+        "client/control.py",          # agent.py 会 import control，缺了双击只会打点超时
+    ],
+    "python": [
+        "client/workspace/python/python.exe",
+        "client/workspace/python/Lib/site-packages/pip/__init__.py",   # 没 pip 就是残包
+    ],
+    "node": [
+        "client/workspace/node/node.exe",
+    ],
+    "fetch_page": [
+        "client/workspace/fetch_page.js",
+    ],
+    "screen_ui": [
+        "client/workspace/GUI/virtual_ui.py",
+    ],
+}
+
+
+def _component_missing_files(key, entries):
+    """返回该组件在 client.zip 里**缺失**的关键文件（空列表 = 齐全）。"""
+    need = COMPONENT_REQUIRED.get(key) or []
+    have = set(entries)
+    return [n for n in need if n not in have]
+
+
 @app.route('/api/build-client-zip', methods=['POST'])
 def build_client_zip():
     """根据用户选择的组件，动态打包并下载自定义 zip。
@@ -8974,12 +10782,35 @@ def build_client_zip():
         return jsonify({"error": "client.zip 不存在，无法打包"}), 400
 
     zip_entries = set()   # 需要从 client.zip 提取的条目名（相对 client/ 的路径）
+    problems = []         # [(组件显示名, 缺失说明)]
+    per_comp = {}
     for key in selected:
         comp = CLIENT_COMPONENTS.get(key)
         if not comp:
+            problems.append((str(key), "未知组件名"))
             continue
-        for n in _zip_entries_for_comp(comp):
-            zip_entries.add(n)
+        ents = _zip_entries_for_comp(comp)
+        if not ents:
+            problems.append((comp["name"], "client.zip 里找不到这个组件的任何文件"))
+            continue
+        miss = _component_missing_files(key, ents)
+        if miss:
+            problems.append((comp["name"], "缺少关键文件：" + "、".join(
+                os.path.basename(m) for m in miss)))
+            continue
+        per_comp[key] = len([n for n in ents if not n.endswith('/')])
+        zip_entries.update(ents)
+
+    # ★ 问题9：任何一个所选组件不完整就**拒绝打包**，不再静默产出半成品
+    if problems:
+        detail = "；".join(f"{n} —— {why}" for n, why in problems)
+        logging.warning(f"[CLIENT-ZIP] 拒绝打包（组件不完整）: {detail}")
+        return jsonify({
+            "error": "组件不完整，已取消打包（避免拿到解压后跑不起来的残包）",
+            "details": [{"component": n, "reason": why} for n, why in problems],
+            "hint": "请用 tool/pack_all.bat 重新生成 server/workspace/client.zip，"
+                    "或改选其它组件后再下载。",
+        }), 400
 
     if not zip_entries:
         return jsonify({"error": "所选组件在 client.zip 中不存在，无法打包"}), 400
@@ -8997,6 +10828,12 @@ def build_client_zip():
         has_workspace = any(n.startswith('client/workspace/') for n in zip_entries)
         if not has_workspace:
             zf.writestr("client/workspace/.keep", "")
+
+        # 2026-11-11: no CLIENT_MANIFEST.json any more. Integrity is enforced
+        # BEFORE packing (see `problems` above); the user only wants an error
+        # when something is missing, not an extra file to eyeball.
+        logging.info(f"[CLIENT-ZIP] 打包完成: {len([n for n in zip_entries if not n.endswith('/')])} 个文件, "
+                     f"组件={ {k: per_comp.get(k, 0) for k in selected if k in per_comp} }")
 
     buf.seek(0)
     return send_file(
@@ -9116,6 +10953,45 @@ def _run_control_panel():
     )
 
 
+def _warmup_llm_async(delay=1.5):
+    """启动预热：把「第一次调用」的一次性开销挪到没人等的时候。
+
+    ★ 2026-11-12 实测：进程刚起来时的**第一次** /chat 首 token 要 3.46s，
+      之后稳定在 0.6~0.9s。这段 2.5~3s 是 openai 客户端初始化、TLS 握手、
+      连接池建立、tokenizer 懒加载等一次性成本 —— 用户第一次发消息就会觉得
+      "卡住了"，还以为服务没反应。
+    这里在启动后静默发一个 max_tokens=8 的最小请求把连接捂热。
+    没配 key / 离线 / 端点不通时一律忽略，绝不影响启动。
+    """
+    def _work():
+        time.sleep(delay)
+        try:
+            _s = load_server_settings()
+            _pid = _s.get("provider_id") or None
+            _model = str(_s.get("model") or _s.get("model_name") or "").strip()
+            if not _model:
+                _provs = _s.get("providers") or []
+                _pr = next((p for p in _provs if _pid and p.get("id") == _pid), None) \
+                    or (_provs[0] if _provs else None)
+                if _pr:
+                    _pid = _pid or _pr.get("id")
+                    _ms = _pr.get("models") or []
+                    if _ms:
+                        _model = str(_ms[0].get("name") or "").strip()
+            if not _model:
+                return
+            _cli = get_client_for_provider(_pid, _model)
+            _t0 = time.time()
+            _cli.chat.completions.create(
+                model=_model,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=8, stream=False)
+            logging.info(f"[WARMUP] LLM 预热完成 {time.time() - _t0:.2f}s（{_model}）")
+        except Exception as _e:
+            logging.info(f"[WARMUP] 跳过（{type(_e).__name__}: {_e}）")
+    threading.Thread(target=_work, daemon=True, name="llm-warmup").start()
+
+
 if __name__ == '__main__':
     # ★ 参数约定（产品入口就这两个）：
     #     --control / -c / --gui   打开图形控制面板（server 端面板可管「服务端 + 本机代理」）
@@ -9137,4 +11013,5 @@ if __name__ == '__main__':
         pass
     port = int(os.environ.get('PORT', '5000'))
     logging.info(f"服务器启动，端口 {port}")
+    _warmup_llm_async()
     app.run(debug=False, threaded=True, host='0.0.0.0', port=port)

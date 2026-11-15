@@ -76,7 +76,7 @@ TOOL_OUTPUT_DIR = os.path.join(WORK_DIR, 'tool_outputs')
 # ★ 本地代理版本号。与 server/app.py 的 APP_VERSION 对应：
 #   前端拿两者比对，代理版本低于服务器版本时提示升级。
 #   未标记版本的老代理（/health 不含 version）统一按 '2.0' 处理。
-AGENT_VERSION = '2.1'
+AGENT_VERSION = '2.3.7'
 
 # ---- 屏幕操作组件（虚拟桌面 + OCR + 模拟键鼠）位于 workspace/GUI 目录 ----
 # virtual_ui.py / ocr.ps1 / capture_dll / README_SCREEN_UI.md 统一放在 GUI 文件夹
@@ -1430,18 +1430,157 @@ def execute_legacy():
     out = _maybe_persist_output(out, truncate, "exec")
     return jsonify({"output": out, "returncode": ret})
 
+def _open_path_candidates(raw):
+    """给一个"模型写出来的路径"生成一串**可能位置**，按优先级排序（问题7）。
+
+    背景（用户实测）：模型在最终答复里写 `[文件: workspace/workspace/README.md]`，
+    点开报 `[WinError 2] 系统找不到指定的文件`。原因有三：
+      ① 客户端进程的 cwd 是 client/，而真实文件在 client/workspace/ 下，
+         模型却把路径写成 `workspace/xxx` —— 于是拼出 workspace/workspace/xxx；
+      ② 模型有时只写文件名（README.md）；
+      ③ 模型把 Windows 反斜杠写成正斜杠、或带引号。
+    这里不猜"唯一真相"，而是把常见拼法都列出来，交给调用方按"存在性"择优。
+    """
+    raw = (raw or '').strip()
+    if not raw:
+        return []
+    # 去掉成对引号 / 零散引号（模型常写 [文件: "D:\a b\c.txt"]）
+    raw = raw.strip().strip('"').strip("'").strip()
+    raw = os.path.expanduser(os.path.expandvars(raw))
+    out = []
+
+    def _add(p):
+        if not p:
+            return
+        try:
+            p = os.path.normpath(p)
+        except Exception:
+            return
+        if p not in out:
+            out.append(p)
+
+    # ① 原样（绝对路径；相对路径按当前 cwd 解释）
+    _add(os.path.abspath(raw))
+
+    if not os.path.isabs(raw):
+        norm = raw.replace('\\', '/')
+        while norm.startswith('./'):
+            norm = norm[2:]
+        # ② 相对 BASE_DIR（client/）与 WORK_DIR（client/workspace/）
+        _add(os.path.join(BASE_DIR, norm))
+        _add(os.path.join(WORK_DIR, norm))
+        # ③ 模型爱写 `workspace/...`：工作目录本身就在 client/ 下，
+        #    拼 base 会得到 workspace/workspace/...，剥掉一层再试。
+        segs = [s for s in norm.split('/') if s not in ('', '.')]
+        if segs and segs[0].lower() == 'workspace':
+            rest = '/'.join(segs[1:])
+            if rest:
+                _add(os.path.join(WORK_DIR, rest))
+                _add(os.path.join(BASE_DIR, rest))
+        # ④ 任意位置的重复 `workspace/workspace`：收敛成一层
+        while 'workspace/workspace' in norm.lower():
+            _i = norm.lower().index('workspace/workspace')
+            norm = norm[:_i] + norm[_i + len('workspace/'):]
+        _add(os.path.join(WORK_DIR, norm))
+        _add(os.path.join(BASE_DIR, norm))
+        # ⑤ 只给了文件名：先试 workspace 根，再在工作目录浅层找同名文件
+        if len(segs) == 1:
+            name = segs[0]
+            _add(os.path.join(WORK_DIR, name))
+            try:
+                hits = 0
+                for root, dirs, files in os.walk(WORK_DIR):
+                    depth = root[len(WORK_DIR):].count(os.sep)
+                    if depth >= 3:
+                        dirs[:] = []
+                    if name in files:
+                        _add(os.path.join(root, name))
+                        hits += 1
+                        if hits >= 3:
+                            break
+            except Exception:
+                pass
+    return out
+
+
+def resolve_open_path(raw):
+    """把路径解析成磁盘上真实存在的绝对路径；找不到返回 (None, 候选列表)。"""
+    cands = _open_path_candidates(raw)
+    for p in cands:
+        if os.path.exists(p):
+            return p, cands
+    return None, cands
+
+
 @app.route('/open', methods=['POST'])
 def open_file():
     data = request.get_json()
     path = data.get('path', '') if data else ''
     if not path: return jsonify({"error": "缺少 path"}), 400
-    if not os.path.exists(path): return jsonify({"error": f"文件不存在: {path}"}), 404
+    # ★ BUGFIX(2026-11-11, 问题7)：智能解析（绝对路径 / 相对 client / 相对 workspace /
+    #   重复 workspace 前缀 / 纯文件名），不再对模型给的相对路径直接判死。
+    resolved, cands = resolve_open_path(path)
+    if not resolved:
+        # 报错里带上"试过哪些位置"，下次排查不用再猜
+        return jsonify({
+            "error": f"文件不存在: {path}",
+            "tried": cands[:6],
+            "hint": "已尝试按 客户端目录 / workspace 目录 / 文件名搜索，均未找到",
+        }), 404
     try:
-        if platform.system() == 'Windows': os.startfile(path)
-        elif platform.system() == 'Darwin': subprocess.Popen(['open', path], creationflags=_CREATE_NO_WINDOW)
-        else: subprocess.Popen(['xdg-open', path], creationflags=_CREATE_NO_WINDOW)
-        return jsonify({"success": True})
-    except Exception as e: return jsonify({"error": str(e)}), 500
+        if platform.system() == 'Windows': os.startfile(resolved)
+        elif platform.system() == 'Darwin': subprocess.Popen(['open', resolved], creationflags=_CREATE_NO_WINDOW)
+        else: subprocess.Popen(['xdg-open', resolved], creationflags=_CREATE_NO_WINDOW)
+        return jsonify({"success": True, "path": resolved,
+                        "note": ("" if os.path.normpath(resolved) == os.path.normpath(path)
+                                 else f"已按实际位置打开: {resolved}")})
+    except Exception as e: return jsonify({"error": str(e), "path": resolved}), 500
+
+def _win_reveal(target):
+    """在资源管理器里定位并选中 target（Windows）。
+
+    ★ 2026-11-13：改用 Shell API `SHOpenFolderAndSelectItems` —— 不走命令行，
+      不会被空格 / 正斜杠 / 引号搞坏（旧写法 `explorer /select,<路径>` 一旦路径含空格，
+      Python 会给整串加引号，explorer 解析失败就退回打开「文档」）。
+    返回 True 表示调用成功；False 交给调用方走命令行兜底。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        _shell32 = ctypes.windll.shell32
+        _ole32 = ctypes.windll.ole32
+        # 该函数在线程里调用需要 COM；已初始化过会返回 S_FALSE，同样可以安全 CoUninitialize
+        _ole32.CoInitializeEx(None, 0x2)   # COINIT_APARTMENTTHREADED
+        try:
+            _shell32.SHParseDisplayName.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p,
+                                                    ctypes.POINTER(ctypes.c_void_p),
+                                                    wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+            _shell32.SHParseDisplayName.restype = ctypes.c_long
+            _shell32.SHOpenFolderAndSelectItems.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                                                            ctypes.c_void_p, wintypes.DWORD]
+            _shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+            _pidl = ctypes.c_void_p()
+            _attrs = wintypes.DWORD()
+            _hr = _shell32.SHParseDisplayName(wintypes.LPCWSTR(target), None,
+                                              ctypes.byref(_pidl), 0, ctypes.byref(_attrs))
+            if _hr != 0 or not _pidl.value:
+                return False
+            try:
+                return _shell32.SHOpenFolderAndSelectItems(_pidl, 0, None, 0) == 0
+            finally:
+                try:
+                    _ole32.CoTaskMemFree(_pidl)
+                except Exception:
+                    pass
+        finally:
+            _ole32.CoUninitialize()
+    except Exception as e:
+        try:
+            logging.warning(f"[OPEN_FOLDER] Shell API 失败，退回命令行: {e}")
+        except Exception:
+            pass
+        return False
+
 
 @app.route('/open_folder', methods=['POST'])
 def open_folder():
@@ -1451,11 +1590,25 @@ def open_folder():
     path = (data.get('path') or '').strip().strip('"')
     if not path:
         return jsonify({"error": "缺少 path"}), 400
-    # 允许传入尚不存在的文件路径（打开其父目录），因此不强制 exists 校验
+    # ★ BUGFIX(2026-11-11, 问题7)：先做智能解析；解析不到时退回"最像的那个候选"
+    #   （允许传入尚不存在的文件路径 —— 打开其最近存在的祖先目录）。
+    resolved, cands = resolve_open_path(path)
+    if not resolved:
+        resolved = (cands[0] if cands else os.path.abspath(path))
+    path = resolved
     try:
         system = platform.system()
         if system == 'Windows':
-            target = os.path.abspath(path)
+            # ★ BUGFIX(2026-11-13)：点「打开文件所在位置」总是弹出「文档」。
+            #   原因：原来是 subprocess.Popen(['explorer', '/select,' + target]) ——
+            #     · 路径里带空格（D:\download\DeepChat V2.2\…）时，Python 会给**整个**
+            #       argv 加引号，命令行变成 explorer "/select,D:\a b\f.txt"，
+            #       explorer 认不出被引号包住的开关 → 退回打开默认文件夹（文档）。
+            #     · 前端传来的还是正斜杠路径（D:/download/…），explorer 也不认。
+            #   现在：① 统一 normpath 成反斜杠；② 优先走 Shell API
+            #   SHOpenFolderAndSelectItems（不经过命令行解析，最可靠）；
+            #   ③ 失败再退回 `explorer /select,"<路径>"` 这种只给路径加引号的写法。
+            target = os.path.normpath(os.path.abspath(path))
             if os.path.isdir(target):
                 # 目录：直接打开该目录
                 subprocess.Popen(['explorer', target], creationflags=_CREATE_NO_WINDOW)
@@ -1474,8 +1627,14 @@ def open_folder():
                         return jsonify({"success": True, "opened": probe,
                                         "note": f"目标或其父目录不存在，已打开最近的上级目录: {probe}"})
                     return jsonify({"error": f"目录不存在: {parent}"}), 404
-                # explorer /select,<文件> 会在资源管理器中定位并选中该文件
-                subprocess.Popen(['explorer', '/select,' + target], creationflags=_CREATE_NO_WINDOW)
+                # 在资源管理器中定位并选中该文件
+                if not _win_reveal(target):
+                    if os.path.isfile(target):
+                        subprocess.Popen('explorer /select,"%s"' % target,
+                                         creationflags=_CREATE_NO_WINDOW)
+                    else:
+                        # 文件不存在：打开父目录（至少比弹「文档」有用）
+                        subprocess.Popen(['explorer', parent], creationflags=_CREATE_NO_WINDOW)
         elif system == 'Darwin':
             if os.path.isdir(path):
                 subprocess.Popen(['open', path], creationflags=_CREATE_NO_WINDOW)

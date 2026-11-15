@@ -10,6 +10,9 @@ Chat5050 · 极简单群聊服务
   * 昵称即身份：管理员 / 普通用户、禁言 / 未禁言、锁定 / 未锁定；
   * 同时提供 Web 前端和 headless JSON API，二者读写同一份数据；
   * 使用 SQLite + 本地文件存储，默认监听 0.0.0.0:5050。
+  * v2.1：新增「共享桌面」——同一份身份与附件之上的二维无限画布，
+    可放置文字 / 图片 / 文件、自由涂鸦、平移缩放、看到他人实时光标；
+    网页默认线性视图，可一键切换成桌面视图，两套内容互不覆盖。
 
 权限模型（v2 新增）：
   * 初始只有 root 是管理员，并且 root 昵称默认锁定；
@@ -36,6 +39,8 @@ Chat5050 · 极简单群聊服务
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import mimetypes
 import os
 import re
@@ -66,7 +71,7 @@ from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Chat5050"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 GROUP_NAME = "大厅"
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -82,6 +87,20 @@ MAX_UPLOAD = MAX_UPLOAD_MB * 1024 * 1024
 MAX_TEXT = 4000
 MAX_NICK = 24
 PRESENCE_TTL = 75  # 秒：超过该时间没有请求则视为离线
+
+# 共享桌面
+DESK_MAX_TEXT = 2000           # 单张便签 / 单个文件说明的字符数
+DESK_MAX_BODY = 120_000        # 笔画 JSON 上限（字节）
+DESK_MAX_POINTS = 1500         # 单笔最多采样点
+DESK_MAX_DIM = 20_000          # 物件尺寸上限（世界像素）
+DESK_COORD_LIMIT = 5_000_000   # 坐标绝对值上限，防止溢出与画布失控
+DESK_CURSOR_TTL = 20.0         # 桌面光标有效期（秒）
+DESK_KINDS = ("text", "image", "file", "stroke")
+DESK_BATCH_MAX = 100           # 一次批量移动 / 删除的物件数上限
+# 每张文字便签独立字号（世界像素，随画布缩放；旧数据无该字段时前端按 18px 渲染）
+DESK_NOTE_FONT_MIN = 10.0
+DESK_NOTE_FONT_MAX = 96.0
+DESK_NOTE_FONT_DEFAULT = 18.0
 
 # 权限相关的初始值 / 开关
 ROOT_NICKNAME = (os.environ.get("CHAT_ROOT_NICKNAME") or "root").strip() or "root"
@@ -135,6 +154,13 @@ MSG_SELECT = """
 
 _BAD_INT = object()
 
+DESK_SELECT = """
+    SELECT i.*, a.original_name AS att_name, a.mime AS att_mime,
+           a.size AS att_size
+      FROM desk_items i
+      LEFT JOIN attachments a ON a.id = i.attachment_id
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS attachments (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,6 +186,31 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_id ON messages(id);
+
+-- 共享桌面：每个物件是二维平面上的一个可变实体。
+-- 与 messages 的 append-only 不同，桌面物件允许移动 / 编辑 / 软删除，
+-- 靠全局 desk_rev + 每行 rev 做增量同步（后写覆盖，单进程内单调递增）。
+CREATE TABLE IF NOT EXISTS desk_items (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT    NOT NULL CHECK (kind IN ('text', 'image', 'file', 'stroke')),
+    nickname      TEXT    NOT NULL,
+    color         TEXT    NOT NULL,
+    x             REAL    NOT NULL,
+    y             REAL    NOT NULL,
+    w             REAL    NOT NULL DEFAULT 0,
+    h             REAL    NOT NULL DEFAULT 0,
+    z             INTEGER NOT NULL DEFAULT 0,
+    body          TEXT    NOT NULL DEFAULT '',
+    style         TEXT    NOT NULL DEFAULT '{}',
+    attachment_id INTEGER REFERENCES attachments(id),
+    created_at    TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL,
+    updated_by    TEXT,
+    rev           INTEGER NOT NULL DEFAULT 0,
+    deleted       INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_desk_items_rev ON desk_items(rev);
 
 CREATE TABLE IF NOT EXISTS presence (
     nickname   TEXT PRIMARY KEY,
@@ -214,7 +265,9 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 INSERT OR IGNORE INTO schema_version (version) VALUES ('1');
 INSERT OR IGNORE INTO schema_version (version) VALUES ('2');
+INSERT OR IGNORE INTO schema_version (version) VALUES ('3');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('state_rev', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('desk_rev', '0');
 """
 
 
@@ -1064,6 +1117,25 @@ def insert_text_message(nickname: str, text: str):
     return fetch_message(message_id)
 
 
+def insert_attachment_message(
+    nickname: str, text: str, attachment_id: int, kind: str
+):
+    """桌面 → 线性：复用已上传的附件，不再传一遍文件。"""
+    color = color_for(nickname)
+    stamp = now_iso()
+    with db() as con:
+        cur = con.execute(
+            """
+            INSERT INTO messages (nickname, color, kind, body, attachment_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (nickname, color, kind, text, attachment_id, stamp),
+        )
+        message_id = cur.lastrowid
+    notify_new_message()
+    return fetch_message(message_id)
+
+
 def group_info() -> dict:
     with db() as con:
         count = con.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"]
@@ -1076,6 +1148,9 @@ def group_info() -> dict:
         admin_count = con.execute(
             "SELECT COUNT(*) AS c FROM identities WHERE role = 'admin'"
         ).fetchone()["c"]
+        desk_item_count = con.execute(
+            "SELECT COUNT(*) AS c FROM desk_items WHERE deleted = 0"
+        ).fetchone()["c"]
     people = online_users()
     return {
         "name": GROUP_NAME,
@@ -1084,6 +1159,8 @@ def group_info() -> dict:
         "attachment_count": attachment_count,
         "online_count": len(people),
         "admin_count": admin_count,
+        "desk_item_count": desk_item_count,
+        "desk_active_count": desk_active_count(),
         "max_upload_mb": MAX_UPLOAD_MB,
         "max_text": MAX_TEXT,
         "max_nickname": MAX_NICK,
@@ -1390,14 +1467,32 @@ def api_post_message():
     text, error = normalize_text(raw_text)
     if error:
         return api_error("invalid_text", error, 400)
-    if not text:
+
+    # 可选：把桌面上已有的附件引用进线性流（不重复上传文件）
+    attachment_id = payload.get("attachment_id")
+    kind = "text"
+    if attachment_id is not None:
+        if isinstance(attachment_id, bool) or not isinstance(attachment_id, int):
+            return api_error("invalid_attachment", "attachment_id 必须是整数", 400)
+        with db() as con:
+            row = con.execute(
+                "SELECT mime FROM attachments WHERE id = ?", (attachment_id,)
+            ).fetchone()
+        if not row:
+            return api_error("not_found", "附件不存在", 404)
+        kind = "image" if row["mime"] in INLINE_IMAGE_MIMES else "file"
+
+    if not text and attachment_id is None:
         return api_error("empty_message", "消息内容不能为空", 400)
     if rate_limited(nickname):
         resp = api_error("rate_limited", "发送太快了，请稍后再试", 429)
         resp.headers["Retry-After"] = "10"
         return resp
 
-    row = insert_text_message(nickname, text)
+    if attachment_id is None:
+        row = insert_text_message(nickname, text)
+    else:
+        row = insert_attachment_message(nickname, text, attachment_id, kind)
     viewer = identity_view(nickname)
     return jsonify(
         ok=True, message=message_dict(row, nickname, viewer["is_admin"])
@@ -1688,31 +1783,14 @@ def api_admin_update_identity(nickname: str):
 # 上传 / 下载
 # ---------------------------------------------------------------------------
 
-@app.post("/api/upload")
-def api_upload():
-    nickname, error = require_user()
-    if error:
-        return error
-    ensure_identity(nickname)
-    muted = muted_response(nickname)
-    if muted is not None:
-        return muted
-    if rate_limited(f"upload:{nickname}", limit=8, window=20.0):
-        resp = api_error("rate_limited", "上传太频繁，请稍后再试", 429)
-        resp.headers["Retry-After"] = "20"
-        return resp
+def store_upload_file(file) -> tuple[dict | None, object | None]:
+    """把 multipart 文件落盘并写入 attachments，线性消息与桌面物件共用。
 
-    file = request.files.get("file")
-    if file is None or not file.filename:
-        return api_error("file_required", "请通过 multipart/form-data 上传 file 字段", 400)
-
+    返回 (附件信息, 错误响应)。附件信息里的 stored_name 只供内部清理使用，
+    不会出现在任何 API 响应里。
+    """
     display_name = clean_filename(file.filename)
-    caption, error = normalize_text(request.form.get("text"))
-    if error:
-        return api_error("invalid_text", error, 400)
-
     mime = guess_mime(display_name, file.mimetype)
-    kind = "image" if mime in INLINE_IMAGE_MIMES else "file"
     ext = safe_ext(display_name)
 
     temp_path = UPLOAD_DIR / f"{uuid.uuid4().hex}.part"
@@ -1734,15 +1812,14 @@ def api_upload():
         os.replace(temp_path, final_path)
     except RequestEntityTooLarge:
         temp_path.unlink(missing_ok=True)
-        return api_error(
+        return None, api_error(
             "file_too_large", f"单个文件最大 {MAX_UPLOAD_MB} MB", 413
         )
     except OSError as exc:
         temp_path.unlink(missing_ok=True)
         app.logger.exception("保存上传文件失败")
-        return api_error("storage_error", f"保存文件失败：{exc}", 500)
+        return None, api_error("storage_error", f"保存文件失败：{exc}", 500)
 
-    color = color_for(nickname)
     stamp = now_iso()
     try:
         with db() as con:
@@ -1755,17 +1832,74 @@ def api_upload():
                 (final_name, display_name, mime, size, digest.hexdigest(), stamp),
             )
             attachment_id = cur.lastrowid
+    except sqlite3.Error:
+        final_path.unlink(missing_ok=True)
+        app.logger.exception("写入附件记录失败")
+        return None, api_error("storage_error", "保存文件记录失败", 500)
+
+    return {
+        "id": attachment_id,
+        "stored_name": final_name,
+        "name": display_name,
+        "mime": mime,
+        "size": size,
+        "size_human": human_size(size),
+        "is_image": mime in INLINE_IMAGE_MIMES,
+    }, None
+
+
+def drop_orphan_attachment(info: dict) -> None:
+    """物件 / 消息落库失败时清理刚刚保存的附件，避免产生孤儿文件。"""
+    try:
+        with db() as con:
+            con.execute("DELETE FROM attachments WHERE id = ?", (info["id"],))
+        (UPLOAD_DIR / info["stored_name"]).unlink(missing_ok=True)
+    except (OSError, sqlite3.Error):
+        app.logger.exception("清理孤儿附件失败")
+
+
+@app.post("/api/upload")
+def api_upload():
+    nickname, error = require_user()
+    if error:
+        return error
+    ensure_identity(nickname)
+    muted = muted_response(nickname)
+    if muted is not None:
+        return muted
+    if rate_limited(f"upload:{nickname}", limit=8, window=20.0):
+        resp = api_error("rate_limited", "上传太频繁，请稍后再试", 429)
+        resp.headers["Retry-After"] = "20"
+        return resp
+
+    file = request.files.get("file")
+    if file is None or not file.filename:
+        return api_error("file_required", "请通过 multipart/form-data 上传 file 字段", 400)
+
+    caption, error = normalize_text(request.form.get("text"))
+    if error:
+        return api_error("invalid_text", error, 400)
+
+    info, upload_error = store_upload_file(file)
+    if upload_error is not None:
+        return upload_error
+    kind = "image" if info["is_image"] else "file"
+
+    color = color_for(nickname)
+    stamp = now_iso()
+    try:
+        with db() as con:
             cur = con.execute(
                 """
                 INSERT INTO messages
                     (nickname, color, kind, body, attachment_id, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (nickname, color, kind, caption or "", attachment_id, stamp),
+                (nickname, color, kind, caption or "", info["id"], stamp),
             )
             message_id = cur.lastrowid
     except sqlite3.Error:
-        final_path.unlink(missing_ok=True)
+        drop_orphan_attachment(info)
         app.logger.exception("写入上传记录失败")
         return api_error("storage_error", "保存文件记录失败", 500)
 
@@ -1816,6 +1950,833 @@ def api_file(attachment_id: int):
 
 
 # ---------------------------------------------------------------------------
+# 共享桌面：二维无限画布
+#   * 物件（便签 / 图片 / 文件 / 笔画）是可变的，用 desk_rev 做后写覆盖同步；
+#   * 光标 / 视野是瞬时状态，只存进程内存，20 秒无心跳即消失；
+#   * 与线性消息共用昵称、禁言、限流、附件与安全策略，两套内容互不覆盖。
+# ---------------------------------------------------------------------------
+
+_desk_lock = threading.Lock()          # 保护光标表与 presence 版本号
+_desk_cond = threading.Condition()     # 桌面长轮询的唤醒条件
+_desk_cursors: dict[str, dict] = {}
+_desk_rev_value = 0                   # settings.desk_rev 的内存镜像
+_desk_presence_rev = 0
+_desk_last_presence_push = 0.0
+
+
+def init_desk_runtime() -> None:
+    """启动时把 desk_rev 内存镜像与数据库对齐（重启后客户端游标仍然有效）。"""
+    global _desk_rev_value
+    with db() as con:
+        row = con.execute(
+            "SELECT value FROM settings WHERE key = 'desk_rev'"
+        ).fetchone()
+        try:
+            value = int(row["value"]) if row else 0
+        except (TypeError, ValueError):
+            value = 0
+        top = con.execute(
+            "SELECT COALESCE(MAX(rev), 0) AS m FROM desk_items"
+        ).fetchone()["m"]
+        value = max(value, int(top or 0))
+        con.execute(
+            """
+            INSERT INTO settings (key, value) VALUES ('desk_rev', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (str(value),),
+        )
+    _desk_rev_value = value
+
+
+def desk_rev_now() -> int:
+    return _desk_rev_value
+
+
+def notify_desk() -> None:
+    with _desk_cond:
+        _desk_cond.notify_all()
+
+
+def _publish_desk_rev(value: int) -> None:
+    global _desk_rev_value
+    if value > _desk_rev_value:
+        _desk_rev_value = value
+    notify_desk()
+
+
+def _next_desk_rev(con: sqlite3.Connection) -> int:
+    """在调用方的事务内推进版本号，返回新值。"""
+    con.execute(
+        """
+        UPDATE settings
+           SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+         WHERE key = 'desk_rev'
+        """
+    )
+    row = con.execute(
+        "SELECT value FROM settings WHERE key = 'desk_rev'"
+    ).fetchone()
+    return int(row["value"]) if row else desk_rev_now() + 1
+
+
+def wait_for_desk(since_rev: int, since_presence: int, timeout: float) -> None:
+    """阻塞到物件有变化，或（限频）桌面光标有变化。"""
+    global _desk_last_presence_push
+    if timeout <= 0:
+        return
+    deadline = time.monotonic() + min(timeout, 25.0)
+    with _desk_cond:
+        while True:
+            now = time.monotonic()
+            if desk_rev_now() > since_rev:
+                return
+            # 光标心跳很密集，最多每 0.18 秒放行一次，避免打爆所有长轮询
+            if (
+                _desk_presence_rev > since_presence
+                and now - _desk_last_presence_push >= 0.18
+            ):
+                _desk_last_presence_push = now
+                return
+            remaining = deadline - now
+            if remaining <= 0:
+                return
+            _desk_cond.wait(min(remaining, 0.2))
+
+
+def active_desk_cursors() -> list[dict]:
+    """仍在有效期内的桌面光标（含调用者自己，客户端按 client_id 过滤）。"""
+    now = time.monotonic()
+    with _desk_lock:
+        for key in [
+            key
+            for key, value in _desk_cursors.items()
+            if now - value["ts"] > DESK_CURSOR_TTL
+        ]:
+            _desk_cursors.pop(key, None)
+        records = [dict(value) for value in _desk_cursors.values()]
+    result = []
+    for record in records:
+        ts = record.pop("ts", now)
+        record["idle"] = round(max(0.0, now - ts), 1)
+        result.append(record)
+    return result
+
+
+def desk_active_count() -> int:
+    return len({cursor["nickname"] for cursor in active_desk_cursors()})
+
+
+# ---- 输入校验：所有来自客户端的数字 / 颜色 / 笔画都在这里收敛 ----
+
+def clamp_number(
+    value,
+    default: float = 0.0,
+    low: float = -float(DESK_COORD_LIMIT),
+    high: float = float(DESK_COORD_LIMIT),
+) -> float:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return max(low, min(high, number))
+
+
+def desk_coord(value, default: float = 0.0) -> float:
+    return round(clamp_number(value, default), 2)
+
+
+def desk_dim(value, default: float = 0.0) -> float:
+    return round(clamp_number(value, default, 0.0, DESK_MAX_DIM), 2)
+
+
+def clean_desk_style(raw) -> dict:
+    """只保留白名单字段；颜色必须是 #rrggbb，杜绝 CSS 注入。"""
+    if not isinstance(raw, dict):
+        raw = {}
+    out: dict = {}
+    for key in ("color", "note"):
+        value = raw.get(key)
+        if isinstance(value, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            out[key] = value.lower()
+    if "width" in raw:
+        out["width"] = round(clamp_number(raw.get("width"), 3.0, 0.5, 40.0), 1)
+    if "fontSize" in raw:
+        # 只接受数字并夹到合理范围，杜绝往 style 里塞任意 CSS
+        out["fontSize"] = round(
+            clamp_number(
+                raw.get("fontSize"),
+                DESK_NOTE_FONT_DEFAULT,
+                DESK_NOTE_FONT_MIN,
+                DESK_NOTE_FONT_MAX,
+            ),
+            1,
+        )
+    source = raw.get("source")
+    if isinstance(source, dict):
+        message_id = source.get("message_id")
+        out["source"] = {
+            "from": str(source.get("from") or "")[:16],
+            "author": str(source.get("author") or "")[:MAX_NICK],
+            "message_id": (
+                message_id
+                if isinstance(message_id, int) and not isinstance(message_id, bool)
+                else None
+            ),
+        }
+    return out
+
+
+def normalize_desk_text(raw) -> tuple[str | None, str | None]:
+    if raw is None:
+        return "", None
+    if not isinstance(raw, str):
+        return None, "文字格式不正确"
+    text = raw.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    if len(text) > DESK_MAX_TEXT:
+        return None, f"桌面文字最多 {DESK_MAX_TEXT} 个字符"
+    return text, None
+
+
+def normalize_stroke(raw) -> tuple[str | None, float, float, str | None]:
+    """笔画 body 是相对坐标点数组，重新紧凑序列化并算出包围盒。"""
+    if not isinstance(raw, str) or not raw or len(raw) > DESK_MAX_BODY:
+        return None, 0.0, 0.0, "笔画数据为空或过大"
+    try:
+        points = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, 0.0, 0.0, "笔画数据不是合法 JSON"
+    if not isinstance(points, list) or not points:
+        return None, 0.0, 0.0, "笔画至少需要一个点"
+    if len(points) > DESK_MAX_POINTS:
+        return None, 0.0, 0.0, f"单笔最多 {DESK_MAX_POINTS} 个点"
+    clean = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            return None, 0.0, 0.0, "笔画点格式不正确"
+        for value in point:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None, 0.0, 0.0, "笔画坐标必须是数字"
+            if not math.isfinite(float(value)):
+                return None, 0.0, 0.0, "笔画坐标必须是有限数字"
+        clean.append([desk_coord(point[0]), desk_coord(point[1])])
+    xs = [point[0] for point in clean]
+    ys = [point[1] for point in clean]
+    return (
+        json.dumps(clean, separators=(",", ":")),
+        round(max(xs) - min(xs), 2),
+        round(max(ys) - min(ys), 2),
+        None,
+    )
+
+
+def desk_item_dict(row) -> dict:
+    """物件对外表示；已删除的物件只保留 id / rev / deleted。"""
+    hidden = bool(row["deleted"])
+    attachment = None
+    if not hidden and row["attachment_id"] and row["att_name"]:
+        mime = row["att_mime"] or "application/octet-stream"
+        attachment = {
+            "id": row["attachment_id"],
+            "name": row["att_name"],
+            "mime": mime,
+            "size": row["att_size"] or 0,
+            "size_human": human_size(row["att_size"] or 0),
+            "is_image": mime in INLINE_IMAGE_MIMES,
+            "url": f"/api/files/{row['attachment_id']}",
+            "download_url": f"/api/files/{row['attachment_id']}?download=1",
+        }
+    try:
+        style = json.loads(row["style"] or "{}")
+    except (TypeError, ValueError):
+        style = {}
+    if not isinstance(style, dict):
+        style = {}
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "nickname": row["nickname"],
+        "color": row["color"],
+        "x": row["x"],
+        "y": row["y"],
+        "w": row["w"],
+        "h": row["h"],
+        "z": row["z"] or row["id"],
+        "body": "" if hidden else row["body"],
+        "style": {} if hidden else style,
+        "attachment": attachment,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "updated_by": row["updated_by"],
+        "rev": row["rev"],
+        "deleted": hidden,
+    }
+
+
+def fetch_desk_item(item_id: int):
+    with db() as con:
+        return con.execute(DESK_SELECT + " WHERE i.id = ?", (item_id,)).fetchone()
+
+
+def desk_int_arg(name: str, default: int):
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return _BAD_INT
+
+
+def desk_payload() -> dict:
+    """创建物件支持纯 JSON，也支持 multipart 里塞一个 meta JSON 字段。"""
+    if "meta" in request.form:
+        try:
+            value = json.loads(request.form.get("meta") or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+    return json_body()
+
+
+# ---- 读取：快照 + 增量长轮询 ----
+
+@app.get("/api/desk/snapshot")
+def api_desk_snapshot():
+    _, error = require_user()
+    if error:
+        return error
+    before_id = desk_int_arg("before_id", 2**62)
+    limit = desk_int_arg("limit", 400)
+    if _BAD_INT in (before_id, limit):
+        return api_error("bad_request", "before_id / limit 必须是整数", 400)
+    before_id = max(0, before_id)
+    limit = max(1, min(limit, 500))
+
+    with db() as con:
+        rows = con.execute(
+            DESK_SELECT
+            + " WHERE i.deleted = 0 AND i.id < ? ORDER BY i.id DESC LIMIT ?",
+            (before_id, limit),
+        ).fetchall()
+        earliest = rows[-1]["id"] if rows else 0
+        has_more = len(rows) == limit and bool(
+            con.execute(
+                "SELECT 1 FROM desk_items WHERE deleted = 0 AND id < ? LIMIT 1",
+                (earliest,),
+            ).fetchone()
+        )
+    return jsonify(
+        ok=True,
+        items=[desk_item_dict(row) for row in reversed(rows)],
+        count=len(rows),
+        has_more=has_more,
+        rev=desk_rev_now(),
+        presence_rev=_desk_presence_rev,
+        presence=active_desk_cursors(),
+        server_time=now_iso(),
+    )
+
+
+@app.get("/api/desk/events")
+def api_desk_events():
+    """桌面增量：物件变化 + 在线光标，同时用于 25 秒长轮询。"""
+    _, error = require_user()
+    if error:
+        return error
+    since_rev = desk_int_arg("since_rev", 0)
+    since_presence = desk_int_arg("since_presence", 0)
+    wait = desk_int_arg("wait", 0)
+    limit = desk_int_arg("limit", 300)
+    if _BAD_INT in (since_rev, since_presence, wait, limit):
+        return api_error(
+            "bad_request",
+            "since_rev / since_presence / wait / limit 必须是整数",
+            400,
+        )
+    since_rev = max(0, since_rev)
+    since_presence = max(0, since_presence)
+    # 光标版本号只在内存里，服务重启后归零；客户端拿着旧值会一直等不到唤醒
+    if since_presence > _desk_presence_rev:
+        since_presence = 0
+    wait = max(0, min(wait, 25))
+    limit = max(1, min(limit, 500))
+
+    wait_for_desk(since_rev, since_presence, wait)
+    with db() as con:
+        rows = con.execute(
+            DESK_SELECT + " WHERE i.rev > ? ORDER BY i.rev ASC LIMIT ?",
+            (since_rev, limit),
+        ).fetchall()
+    return jsonify(
+        ok=True,
+        items=[desk_item_dict(row) for row in rows],
+        count=len(rows),
+        has_more=len(rows) == limit,
+        rev=desk_rev_now(),
+        presence_rev=_desk_presence_rev,
+        presence=active_desk_cursors(),
+        server_time=now_iso(),
+    )
+
+
+# ---- 写入：放置 / 移动 / 编辑 / 删除 / 恢复 ----
+
+@app.post("/api/desk/items")
+def api_desk_create_item():
+    payload = desk_payload()
+    nickname, error = require_user(payload)
+    if error:
+        return error
+    ensure_identity(nickname)
+    muted = muted_response(nickname)
+    if muted is not None:
+        return muted
+    if rate_limited(f"desk:create:{nickname}", limit=40, window=10.0):
+        resp = api_error("rate_limited", "放置太快了，请稍后再试", 429)
+        resp.headers["Retry-After"] = "10"
+        return resp
+
+    kind = payload.get("kind")
+    if kind not in DESK_KINDS:
+        return api_error(
+            "invalid_kind", "物件类型必须是 text / image / file / stroke", 400
+        )
+
+    x = desk_coord(payload.get("x"))
+    y = desk_coord(payload.get("y"))
+    w = desk_dim(payload.get("w"))
+    h = desk_dim(payload.get("h"))
+    style = clean_desk_style(payload.get("style"))
+    body = ""
+    attachment_id = None
+    upload_info = None
+
+    file = request.files.get("file")
+    if file is not None and file.filename:
+        if kind in ("text", "stroke"):
+            return api_error("invalid_kind", "文字 / 笔画物件不能带文件", 400)
+        upload_info, upload_error = store_upload_file(file)
+        if upload_error is not None:
+            return upload_error
+        attachment_id = upload_info["id"]
+        kind = "image" if upload_info["is_image"] else "file"
+
+    if kind in ("image", "file"):
+        text, text_error = normalize_desk_text(payload.get("body"))
+        if text_error:
+            return api_error("invalid_text", text_error, 400)
+        body = text
+        if attachment_id is None:
+            raw_id = payload.get("attachment_id")
+            if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+                return api_error(
+                    "invalid_attachment", "attachment_id 必须是整数", 400
+                )
+            with db() as con:
+                row = con.execute(
+                    "SELECT mime FROM attachments WHERE id = ?", (raw_id,)
+                ).fetchone()
+            if not row:
+                return api_error("not_found", "附件不存在", 404)
+            attachment_id = raw_id
+            kind = "image" if row["mime"] in INLINE_IMAGE_MIMES else "file"
+        if not w:
+            w = 320.0 if kind == "image" else 260.0
+        if not h:
+            h = 220.0 if kind == "image" else 96.0
+    elif kind == "text":
+        text, text_error = normalize_desk_text(payload.get("body"))
+        if text_error:
+            return api_error("invalid_text", text_error, 400)
+        if not text.strip():
+            return api_error("empty_item", "便签内容不能为空", 400)
+        body = text
+        w = w or 260.0
+        h = 0.0  # 便签高度按内容自适应，不写入数据库
+    else:  # stroke
+        normalized, box_w, box_h, stroke_error = normalize_stroke(
+            payload.get("body")
+        )
+        if stroke_error:
+            return api_error("invalid_stroke", stroke_error, 400)
+        body = normalized
+        w, h = box_w, box_h
+        style.setdefault("color", "#f5b544")
+        style.setdefault("width", 3.0)
+
+    stamp = now_iso()
+    try:
+        with db() as con:
+            rev = _next_desk_rev(con)
+            cur = con.execute(
+                """
+                INSERT INTO desk_items
+                    (kind, nickname, color, x, y, w, h, z, body, style,
+                     attachment_id, created_at, updated_at, updated_by, rev)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    kind, nickname, color_for(nickname), x, y, w, h, body,
+                    json.dumps(style, ensure_ascii=False, separators=(",", ":")),
+                    attachment_id, stamp, stamp, nickname, rev,
+                ),
+            )
+            item_id = cur.lastrowid
+    except sqlite3.Error:
+        if upload_info:
+            drop_orphan_attachment(upload_info)
+        app.logger.exception("写入桌面物件失败")
+        return api_error("storage_error", "保存桌面物件失败", 500)
+
+    _publish_desk_rev(rev)
+    return jsonify(
+        ok=True, item=desk_item_dict(fetch_desk_item(item_id)), rev=rev
+    ), 201
+
+
+@app.post("/api/desk/items/batch")
+def api_desk_batch_items():
+    """多选 / 框选后的批量移动、删除或文字字号：一次请求、一个版本号、一次唤醒。
+
+    move      —— 位置人人可改，与单个 PATCH 的规则一致；
+    delete    —— 只允许作者或管理员，任一物件越权则整批拒绝；
+    font_size —— 只作用于文字便签，同样限作者或管理员，非文字物件自动跳过。
+    """
+    payload = json_body()
+    nickname, error = require_user(payload)
+    if error:
+        return error
+    muted = muted_response(nickname)
+    if muted is not None:
+        return muted
+    if rate_limited(f"desk:batch:{nickname}", limit=60, window=10.0):
+        resp = api_error("rate_limited", "操作太快了，请稍后再试", 429)
+        resp.headers["Retry-After"] = "10"
+        return resp
+
+    action = payload.get("action")
+    entries = payload.get("items")
+    if action not in ("move", "delete", "font_size"):
+        return api_error("invalid_action", "action 只能是 move、delete 或 font_size", 400)
+    if not isinstance(entries, list) or not 1 <= len(entries) <= DESK_BATCH_MAX:
+        return api_error(
+            "invalid_items", f"items 需为 1~{DESK_BATCH_MAX} 个物件的数组", 400
+        )
+    font_size = None
+    if action == "font_size":
+        font_size = clean_desk_style({"fontSize": payload.get("fontSize")})["fontSize"]
+
+    by_id: dict = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return api_error("invalid_items", "每个物件必须是对象", 400)
+        item_id = entry.get("id")
+        if isinstance(item_id, bool) or not isinstance(item_id, int) or item_id <= 0:
+            return api_error("invalid_items", "物件 id 必须是正整数", 400)
+        by_id.setdefault(item_id, entry)
+    ids = list(by_id)
+
+    placeholders = ", ".join("?" for _ in ids)
+    with db() as con:
+        rows = con.execute(
+            f"SELECT * FROM desk_items WHERE id IN ({placeholders}) AND deleted = 0",
+            ids,
+        ).fetchall()
+    found = {row["id"]: row for row in rows}
+
+    admin = is_admin(nickname)
+    if action in ("delete", "font_size"):
+        forbidden = [
+            item_id
+            for item_id in ids
+            if item_id in found
+            and not admin
+            and found[item_id]["nickname"] != nickname
+            # 批量改字号时非文字物件会被跳过，不必因它整批拒绝
+            and (action == "delete" or found[item_id]["kind"] == "text")
+        ]
+        if forbidden:
+            return api_error(
+                "forbidden",
+                "没有权限修改物件 " + ", ".join(str(i) for i in forbidden[:5]),
+                403,
+            )
+
+    stamp = now_iso()
+    changed: list[int] = []
+    try:
+        with db() as con:
+            rev = _next_desk_rev(con)
+            for item_id in ids:
+                row = found.get(item_id)
+                if not row:
+                    continue
+                if action == "move":
+                    x = desk_coord(by_id[item_id].get("x"), row["x"])
+                    y = desk_coord(by_id[item_id].get("y"), row["y"])
+                    con.execute(
+                        "UPDATE desk_items SET x = ?, y = ?, rev = ?, "
+                        "updated_at = ?, updated_by = ? WHERE id = ?",
+                        (x, y, rev, stamp, nickname, item_id),
+                    )
+                elif action == "delete":
+                    con.execute(
+                        "UPDATE desk_items SET deleted = 1, rev = ?, "
+                        "updated_at = ?, updated_by = ? WHERE id = ?",
+                        (rev, stamp, nickname, item_id),
+                    )
+                else:  # font_size：合并进原有 style，保留颜色 / 来源等信息
+                    if row["kind"] != "text":
+                        continue
+                    try:
+                        style = json.loads(row["style"] or "{}")
+                    except (TypeError, ValueError):
+                        style = {}
+                    if not isinstance(style, dict):
+                        style = {}
+                    style["fontSize"] = font_size
+                    con.execute(
+                        "UPDATE desk_items SET style = ?, rev = ?, "
+                        "updated_at = ?, updated_by = ? WHERE id = ?",
+                        (
+                            json.dumps(
+                                style, ensure_ascii=False, separators=(",", ":")
+                            ),
+                            rev,
+                            stamp,
+                            nickname,
+                            item_id,
+                        ),
+                    )
+                changed.append(item_id)
+    except sqlite3.Error:
+        app.logger.exception("批量更新桌面物件失败")
+        return api_error("storage_error", "批量更新桌面物件失败", 500)
+
+    _publish_desk_rev(rev)
+    return jsonify(
+        ok=True,
+        action=action,
+        changed=len(changed),
+        items=[desk_item_dict(fetch_desk_item(i)) for i in changed],
+        font_size=font_size,
+        rev=rev,
+    )
+
+
+@app.patch("/api/desk/items/<int:item_id>")
+def api_desk_update_item(item_id: int):
+    """移动 / 缩放人人可做；改内容、层级、删除限作者或管理员。"""
+    nickname, error = require_user()
+    if error:
+        return error
+    muted = muted_response(nickname)
+    if muted is not None:
+        return muted
+    if rate_limited(f"desk:edit:{nickname}", limit=120, window=10.0):
+        resp = api_error("rate_limited", "操作太快了，请稍后再试", 429)
+        resp.headers["Retry-After"] = "10"
+        return resp
+
+    row = fetch_desk_item(item_id)
+    if not row or row["deleted"]:
+        return api_error("not_found", "物件不存在或已被删除", 404)
+    payload = json_body()
+    privileged = row["nickname"] == nickname or is_admin(nickname)
+    if not privileged and any(key in payload for key in ("body", "style", "z")):
+        return api_error(
+            "forbidden", "只能移动 / 缩放他人放置的物件，编辑请找作者或管理员", 403
+        )
+
+    updates: dict = {}
+    for key in ("x", "y"):
+        if key in payload:
+            updates[key] = desk_coord(payload.get(key), row[key])
+    for key in ("w", "h"):
+        if key in payload:
+            updates[key] = desk_dim(payload.get(key), row[key])
+    if "z" in payload:
+        updates["z"] = int(clamp_number(payload.get("z"), row["z"], -1e9, 1e9))
+    if "style" in payload:
+        updates["style"] = json.dumps(
+            clean_desk_style(payload.get("style")),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    if "body" in payload:
+        if row["kind"] == "stroke":
+            normalized, box_w, box_h, stroke_error = normalize_stroke(
+                payload.get("body")
+            )
+            if stroke_error:
+                return api_error("invalid_stroke", stroke_error, 400)
+            updates["body"] = normalized
+            updates["w"], updates["h"] = box_w, box_h
+        else:
+            text, text_error = normalize_desk_text(payload.get("body"))
+            if text_error:
+                return api_error("invalid_text", text_error, 400)
+            updates["body"] = text
+
+    if not updates:
+        return jsonify(ok=True, item=desk_item_dict(row), rev=desk_rev_now())
+
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    try:
+        with db() as con:
+            rev = _next_desk_rev(con)
+            con.execute(
+                f"UPDATE desk_items SET {assignments}, "
+                "rev = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+                (*updates.values(), rev, now_iso(), nickname, item_id),
+            )
+    except sqlite3.Error:
+        app.logger.exception("更新桌面物件失败")
+        return api_error("storage_error", "更新桌面物件失败", 500)
+    _publish_desk_rev(rev)
+    return jsonify(
+        ok=True, item=desk_item_dict(fetch_desk_item(item_id)), rev=rev
+    )
+
+
+def _set_desk_deleted(item_id: int, deleted: bool, actor: str, admin: bool):
+    row = fetch_desk_item(item_id)
+    if not row:
+        return None, "not_found", "物件不存在"
+    if not admin and row["nickname"] != actor:
+        return None, "forbidden", "只能删除自己放置的物件"
+    if bool(row["deleted"]) == deleted:
+        return row, "", ""
+    with db() as con:
+        rev = _next_desk_rev(con)
+        con.execute(
+            """
+            UPDATE desk_items
+               SET deleted = ?, rev = ?, updated_at = ?, updated_by = ?
+             WHERE id = ?
+            """,
+            (1 if deleted else 0, rev, now_iso(), actor, item_id),
+        )
+    _publish_desk_rev(rev)
+    return fetch_desk_item(item_id), "", ""
+
+
+@app.delete("/api/desk/items/<int:item_id>")
+def api_desk_delete_item(item_id: int):
+    nickname, error = require_user()
+    if error:
+        return error
+    muted = muted_response(nickname)
+    if muted is not None:
+        return muted
+    viewer = identity_view(nickname)
+    row, code, message = _set_desk_deleted(
+        item_id, True, nickname, viewer["is_admin"]
+    )
+    if not row:
+        return api_error(code, message, 403 if code == "forbidden" else 404)
+    return jsonify(ok=True, item=desk_item_dict(row), rev=desk_rev_now())
+
+
+@app.post("/api/desk/items/<int:item_id>/restore")
+def api_desk_restore_item(item_id: int):
+    nickname, error = require_user()
+    if error:
+        return error
+    muted = muted_response(nickname)
+    if muted is not None:
+        return muted
+    viewer = identity_view(nickname)
+    row, code, message = _set_desk_deleted(
+        item_id, False, nickname, viewer["is_admin"]
+    )
+    if not row:
+        return api_error(code, message, 403 if code == "forbidden" else 404)
+    return jsonify(ok=True, item=desk_item_dict(row), rev=desk_rev_now())
+
+
+# ---- 在线位置：光标心跳 / 离开 ----
+
+@app.post("/api/desk/cursor")
+def api_desk_cursor():
+    """上报鼠标世界坐标、相机中心与视野，供其他人的桌面渲染光标。"""
+    global _desk_presence_rev
+    nickname, error = require_user()
+    if error:
+        return error
+    payload = json_body()
+    client_id = payload.get("client_id")
+    if not isinstance(client_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{4,64}", client_id
+    ):
+        return api_error("invalid_client", "client_id 格式不正确", 400)
+
+    x = desk_coord(payload.get("x"))
+    y = desk_coord(payload.get("y"))
+    cx = desk_coord(payload.get("cx"), x)
+    cy = desk_coord(payload.get("cy"), y)
+    zoom = clamp_number(payload.get("zoom"), 1.0, 0.05, 20.0)
+    vw = clamp_number(payload.get("vw"), 1000.0, 1.0, 1e6)
+    vh = clamp_number(payload.get("vh"), 700.0, 1.0, 1e6)
+    tool = payload.get("tool")
+    tool = tool if isinstance(tool, str) and re.fullmatch(r"[a-z]{0,16}", tool) else ""
+
+    now = time.monotonic()
+    record = {
+        "client_id": client_id,
+        "nickname": nickname,
+        "color": color_for(nickname),
+        "x": x,
+        "y": y,
+        "cx": cx,
+        "cy": cy,
+        "zoom": round(zoom, 3),
+        "viewport": {
+            "x": round(cx - vw / 2, 2),
+            "y": round(cy - vh / 2, 2),
+            "w": round(vw, 2),
+            "h": round(vh, 2),
+        },
+        "tool": tool,
+        "ts": now,
+    }
+    with _desk_lock:
+        for key in [
+            key
+            for key, value in _desk_cursors.items()
+            if now - value["ts"] > DESK_CURSOR_TTL
+        ]:
+            _desk_cursors.pop(key, None)
+        _desk_cursors[client_id] = record
+        _desk_presence_rev += 1
+        prev = _desk_presence_rev
+    notify_desk()
+    return jsonify(ok=True, presence_rev=prev, rev=desk_rev_now())
+
+
+@app.post("/api/desk/leave")
+def api_desk_leave():
+    """切回线性视图 / 关闭页面时立刻撤下自己的光标。"""
+    global _desk_presence_rev
+    _, error = require_user()
+    if error:
+        return error
+    client_id = json_body().get("client_id")
+    with _desk_lock:
+        if isinstance(client_id, str):
+            _desk_cursors.pop(client_id, None)
+        _desk_presence_rev += 1
+        prev = _desk_presence_rev
+    notify_desk()
+    return jsonify(ok=True, presence_rev=prev)
+
+
+# ---------------------------------------------------------------------------
 # 健康检查 / 错误处理 / 安全响应头
 # ---------------------------------------------------------------------------
 
@@ -1824,6 +2785,9 @@ def api_health():
     try:
         with db() as con:
             count = con.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"]
+            desk_count = con.execute(
+                "SELECT COUNT(*) AS c FROM desk_items WHERE deleted = 0"
+            ).fetchone()["c"]
             versions = [
                 r["version"]
                 for r in con.execute("SELECT version FROM schema_version").fetchall()
@@ -1831,6 +2795,7 @@ def api_health():
         db_ok = True
     except sqlite3.Error:
         count = -1
+        desk_count = -1
         versions = []
         db_ok = False
     return jsonify(
@@ -1840,6 +2805,8 @@ def api_health():
         status="ok" if db_ok else "degraded",
         group=GROUP_NAME,
         message_count=count,
+        desk_item_count=desk_count,
+        desk_active=desk_active_count(),
         db=db_ok,
         schema=versions,
         max_upload_mb=MAX_UPLOAD_MB,
@@ -1887,7 +2854,9 @@ def add_headers(resp):
             "Access-Control-Allow-Headers",
             "Content-Type, X-Nickname, X-Chat-Client, Range",
         )
-        resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        resp.headers.setdefault(
+            "Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS"
+        )
         if not request.path.startswith("/api/files/"):
             resp.headers.setdefault("Cache-Control", "no-store")
     if request.path == "/":
@@ -1923,11 +2892,12 @@ def local_ip() -> str:
 
 def print_banner() -> None:
     print("=" * 58)
-    print(f"  {APP_NAME} v{APP_VERSION} · 单群聊 · 端口 {PORT}")
+    print(f"  {APP_NAME} v{APP_VERSION} · 单群聊 + 共享桌面 · 端口 {PORT}")
     print("=" * 58)
     print(f"  本机访问 : http://127.0.0.1:{PORT}")
     if HOST in ("0.0.0.0", "::"):
         print(f"  局域网   : http://{local_ip()}:{PORT}")
+    print(f"  共享桌面 : http://127.0.0.1:{PORT}/#desk")
     print(f"  数据目录 : {DATA_DIR}")
     print(f"  单文件上限: {MAX_UPLOAD_MB} MB")
     print("  按 Ctrl+C 停止服务")
@@ -1935,6 +2905,7 @@ def print_banner() -> None:
 
 
 init_storage()
+init_desk_runtime()
 
 
 if __name__ == "__main__":

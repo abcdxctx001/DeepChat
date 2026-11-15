@@ -70,61 +70,158 @@ set "PYWEXE="
 set "SCRIPTPATH="
 if exist "%~dp0app.exe" set "EXEPATH=%~dp0app.exe"
 
-if not defined EXEPATH (
-    rem ---- source-only mode ----
-    rem  Two things must hold, and both were broken before:
-    rem    1) the dependencies are installed. Without them the panel cannot start
-    rem       and this window just polls until it times out (we hit that);
-    rem    2) launch through pythonw, NOT python. python.exe is a console-subsystem
-    rem       program, so `start` on it always opens an extra black window;
-    rem       pythonw.exe is the GUI build and shows nothing.
-    rem  Probe pythonw first, then python (as a last resort we still launch, but a
-    rem  console window will appear).
-    set "PYWEXE="
-    set "PIPCMD="
-    for %%D in ("%~dp0..\.backups\venv_pack\Scripts") do (
-        if not defined PYWEXE if exist "%%~Dpythonw.exe" (
-            "%%~Dpythonw.exe" -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
-            if not errorlevel 1 (
-                set "PYWEXE=%%~Dpythonw.exe"
-                set "PIPCMD=%%~Dpython.exe"
-            )
-        )
-        if not defined PYWEXE if not defined PIPCMD if exist "%%~Dpython.exe" (
-            "%%~Dpython.exe" -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
-            if not errorlevel 1 set "PIPCMD=%%~Dpython.exe"
-        )
-    )
-    if not defined PYWEXE (
-        pythonw -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
-        if not errorlevel 1 set "PYWEXE=pythonw"
-    )
-    if not defined PYWEXE if not defined PIPCMD (
-        python -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
-        if not errorlevel 1 set "PIPCMD=python"
-    )
-    if not defined PYWEXE if not defined PIPCMD (
-        echo   Installing Python dependencies ^(first run needs network, about 1 min^)...
-        python -m pip install -q flask flask-cors chardet requests "openai==2.2.0" pystray -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 30 --disable-pip-version-check
-        pythonw -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
-        if not errorlevel 1 set "PYWEXE=pythonw"
-        if not defined PYWEXE (
-            python -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
-            if not errorlevel 1 set "PIPCMD=python"
-        )
-    )
-    if not defined PYWEXE if not defined PIPCMD (
-        echo.
-        echo [ERROR] Python dependencies are missing and could not be installed.
-        echo         Run manually:  python -m pip install flask flask-cors chardet requests "openai==2.2.0" pystray
-        echo         Or download the app.exe build instead ^(no Python needed^).
-        echo.
-        pause
-        exit /b 1
-    )
-    if not defined PYWEXE set "PYWEXE=!PIPCMD!"
-    set "SCRIPTPATH=%~dp0app.py"
+if defined EXEPATH goto :have_exe
+
+rem ============================================================
+rem  source-only mode
+rem
+rem  FIX 2026-11-11 (bug 10: run.bat picked the wrong Python):
+rem    The old order was  ..\.backups\venv_pack  ->  pythonw/python on PATH.
+rem    On the user's machine the python on PATH is
+rem    D:\emacs-26.3-x86_64\bin\python.exe (Emacs' own, no pip at all),
+rem    so double-clicking run.bat failed with "No module named pip".
+rem    Now the bundled interpreter  %~dp0workspace\python\python.exe  is
+rem    ALWAYS tried first; only when it is absent do we fall back to the
+rem    dev venv and finally to PATH.
+rem
+rem  Two older constraints stay valid:
+rem    1) dependencies must be importable, otherwise the panel never starts
+rem       and this window just polls until it times out;
+rem    2) prefer pythonw to launch (python.exe is a console app, so `start`
+rem       on it opens an extra black window).
+rem ============================================================
+set "PIPCMD="
+set "PYWEXE="
+
+set "CAND_PY=%~dp0workspace\python\python.exe"
+set "CAND_PYW=%~dp0workspace\python\pythonw.exe"
+if exist "%~dp0workspace\python\python.exe" goto :probe_env
+set "CAND_PY=%~dp0..\.backups\venv_pack\Scripts\python.exe"
+set "CAND_PYW=%~dp0..\.backups\venv_pack\Scripts\pythonw.exe"
+if exist "%~dp0..\.backups\venv_pack\Scripts\python.exe" goto :probe_env
+rem last resort: python on PATH (this may well be the emacs one)
+set "CAND_PY="
+set "CAND_PYW="
+goto :probe_env
+
+:probe_env
+if not defined CAND_PY goto :probe_path
+"!CAND_PY!" -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
+if errorlevel 1 goto :deps_install
+set "PIPCMD=!CAND_PY!"
+if exist "!CAND_PYW!" (set "PYWEXE=!CAND_PYW!") else (set "PYWEXE=!CAND_PY!")
+goto :py_ready
+
+rem ---- install dependencies into the chosen interpreter ----
+rem  FIX 2026-11-12 (bug B): a bundled python may be an "embeddable" package,
+rem  which ships WITHOUT pip -- so "python -m pip install" dies with
+rem  "No module named pip", the re-probe fails, and the user is told
+rem  "No usable Python found" even though python itself worked fine.
+rem  Probe pip first; try ensurepip and a get-pip.py sitting next to the
+rem  interpreter; only then give up with an accurate message.
+:deps_install
+"!CAND_PY!" -m pip --version >nul 2>nul
+if not errorlevel 1 goto :deps_install_do
+"!CAND_PY!" -m ensurepip --upgrade >nul 2>nul
+"!CAND_PY!" -m pip --version >nul 2>nul
+if not errorlevel 1 goto :deps_install_do
+set "PYDIR=%~dp0workspace\python\"
+for %%F in ("!CAND_PY!") do set "PYDIR=%%~dpF"
+if exist "!PYDIR!get-pip.py" (
+    echo   Bootstrapping pip from "!PYDIR!get-pip.py" ...
+    "!CAND_PY!" "!PYDIR!get-pip.py" --no-warn-script-location >nul 2>nul
 )
+"!CAND_PY!" -m pip --version >nul 2>nul
+if errorlevel 1 goto :deps_no_pip
+
+:deps_install_do
+echo   Installing Python dependencies into:
+echo     !CAND_PY!
+echo   (first run needs network, about 1 min)
+"!CAND_PY!" -m pip install -q flask flask-cors chardet requests "openai==2.2.0" pystray -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 30 --disable-pip-version-check
+"!CAND_PY!" -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
+if errorlevel 1 goto :deps_missing
+set "PIPCMD=!CAND_PY!"
+if exist "!CAND_PYW!" (set "PYWEXE=!CAND_PYW!") else (set "PYWEXE=!CAND_PY!")
+goto :py_ready
+
+rem  FIX 2026-11-12 (bug A): the PATH fallback used to jump straight to
+rem  :deps_missing when the imports failed. But "the imports failed" can also
+rem  mean "there IS a python here, it just lacks the packages" -- telling the
+rem  user "No usable Python found" was flat wrong, and it never tried to
+rem  install anything. Now: if a working interpreter exists on PATH, go
+rem  through the same install path as the bundled one.
+:probe_path
+rem neither bundled nor venv python: fall back to PATH
+pythonw -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
+if not errorlevel 1 (
+    set "PYWEXE=pythonw"
+    set "PIPCMD=python"
+    goto :py_ready
+)
+python -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
+if not errorlevel 1 (
+    set "PIPCMD=python"
+    set "PYWEXE=python"
+    goto :py_ready
+)
+rem imports failed -- is there an interpreter at all?
+python -c "import sys" >nul 2>nul
+if not errorlevel 1 (
+    set "CAND_PY=python"
+    set "CAND_PYW=pythonw"
+    rem pythonw may not exist; deps_install falls back to CAND_PY when missing
+    if not exist "%~dp0workspace\python\pythonw.exe" set "CAND_PYW="
+    goto :deps_install
+)
+pythonw -c "import sys" >nul 2>nul
+if not errorlevel 1 (
+    set "CAND_PY=pythonw"
+    set "CAND_PYW=pythonw"
+    goto :deps_install
+)
+goto :deps_missing
+
+rem  FIX 2026-11-12 (bug B): accurate message -- we DID find python, it just
+rem  has no pip. Telling the user "no python found" sent them hunting for the
+rem  wrong problem.
+:deps_no_pip
+echo.
+echo [ERROR] Found Python but it has NO pip, so dependencies cannot be
+echo         installed automatically:
+echo           !CAND_PY!
+echo.
+echo         This is normal for an "embeddable" Python package. Options:
+echo           1) put get-pip.py next to that python.exe and run again, or
+echo           2) use the full Python installer, or
+echo           3) download the app.exe build (no Python needed).
+echo.
+pause
+exit /b 1
+
+:deps_missing
+echo.
+echo [ERROR] No usable Python found for the source build.
+echo         Looked for (in this order):
+echo           1) "%~dp0workspace\python\python.exe"
+echo           2) "%~dp0..\.backups\venv_pack\Scripts\python.exe"
+echo           3) pythonw / python on PATH
+echo.
+echo         Install the bundled runtime, or run manually:
+echo           python -m pip install flask flask-cors chardet requests "openai==2.2.0" pystray
+echo         Or download the app.exe build instead ^(no Python needed^).
+echo.
+pause
+exit /b 1
+
+:py_ready
+set "SCRIPTPATH=%~dp0app.py"
+goto :after_py
+
+:have_exe
+set "SCRIPTPATH="
+
+:after_py
 
 echo ============================================================
 echo   DeepChat Server
@@ -177,10 +274,49 @@ if exist "%~dp0app.exe" (
     "%~dp0app.exe" --serve
     goto :eof
 )
-py -m pip install flask flask-cors openai chardet requests pystray PyPDF2 python-docx openpyxl python-pptx
+rem FIX 2026-11-11 (bug 10): console path must use the same interpreter as the
+rem   panel path -- never a bare "py"/"python" from PATH.
+rem FIX 2026-11-13: it also ran "pip install" unconditionally on every start
+rem   (about a minute, with network) even when everything was already there.
+rem   Probe first, install only when something is missing; and bootstrap pip
+rem   when the interpreter has none.
+set "PYCON=%~dp0workspace\python\python.exe"
+if not exist "!PYCON!" set "PYCON="
+if not defined PYCON (
+    where py >nul 2>nul
+    if not errorlevel 1 set "PYCON=py"
+)
+if not defined PYCON (
+    python -c "import sys" >nul 2>nul
+    if not errorlevel 1 set "PYCON=python"
+)
+if not defined PYCON (
+    echo.
+    echo [ERROR] No usable Python found for --console mode.
+    echo         Install the bundled runtime, or run the app.exe build instead.
+    echo.
+    pause
+    exit /b 1
+)
+"!PYCON!" -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
+if errorlevel 1 (
+    echo   Installing Python dependencies ^(first run needs network, about 1 min^)...
+    "!PYCON!" -m pip --version >nul 2>nul
+    if errorlevel 1 "!PYCON!" -m ensurepip --upgrade >nul 2>nul
+    "!PYCON!" -m pip install flask flask-cors openai chardet requests pystray PyPDF2 python-docx openpyxl python-pptx -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 30 --disable-pip-version-check
+    "!PYCON!" -c "import flask,flask_cors,chardet,requests,openai,pystray" >nul 2>nul
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Python dependencies are missing and could not be installed.
+        echo         Run manually:  "!PYCON!" -m pip install flask flask-cors openai chardet requests pystray
+        echo.
+        pause
+        exit /b 1
+    )
+)
 start "" http://localhost:5000
 cls
-py app.py --serve
+"!PYCON!" app.py --serve
 goto :eof
 
 rem ============================================================

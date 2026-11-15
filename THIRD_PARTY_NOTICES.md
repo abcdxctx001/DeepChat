@@ -284,3 +284,46 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## 7. Mermaid
+
+| 项 | 内容 |
+|---|---|
+| 位置 | `server/static/vendor/mermaid.min.js` |
+| 上游 | https://github.com/mermaid-js/mermaid |
+| 版本 | 压缩产物内未内嵌可辨识的版本号（提取到的 0.16.9 是包内其它常量，非 Mermaid 版本）；请以实际引入版本的 npm 元数据为准 |
+| 许可 | MIT |
+| 版权 | Copyright (c) 2014 - 2022 Knut Sveidqvist |
+
+用于把聊天回复里的 mermaid 代码块渲染成图表。
+
+> **注意**：`mermaid.min.js` 是把上游及其多个依赖压成单文件的产物。包内另可见
+> `Copyright (c) 2013-2014 Ralf S. Engelschall`、`Copyright Gaetan Renaudeau`
+> 等标识，这些组件同样以 MIT 发布，完整清单见上游仓库的依赖声明。
+> 再分发时请连同本文件一起分发。
+
+以下为上游 LICENSE 原文：
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2014 - 2022 Knut Sveidqvist
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

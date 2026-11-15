@@ -147,12 +147,27 @@ EXCLUDE_NAME_EXACT = {
 # ★ 「可运行版」要带的**运行时数据**（自用版的对话树 + 记忆库）
 #   源码版 / 出厂版一律不带（出厂版是发给别人的，绝不能带我的数据）
 RUNTIME_DATA_PREFIXES = (
-    'server/workspace/memories/',
-    'client/workspace/memories/',
+    # ★ 2026-11-08（按用户要求）：可运行版**不再携带记忆库**。
+    #   记忆是私有数据且体积大（实测 405 MB），交付包里不需要。
+    #   需要时在客户端里 #save / #load 自己同步即可。
+    #   'server/workspace/memories/',
+    #   'client/workspace/memories/',
 )
 RUNTIME_DATA_FILES = {
     'server/workspace/chat_tree.json',
 }
+
+# ★ 2026-11-08：记忆库一律不进交付（可运行版也不带）
+HARD_EXCLUDE_PREFIXES = (
+    # ★ 2026-11-08（按用户要求）：安装器单独放兄弟目录，不进任何交付目录
+    'tool/installer/dist/',
+    'tool/installer/payload.zip',
+
+    'server/workspace/memories/',
+    'client/workspace/memories/',
+    'server/workspace/memories.idx',
+    'server/workspace/memories.idx.meta',
+)
 
 # ★ client/workspace 顶层只保留**功能文件**
 #   （fetch_page.js 被 agent.py/app.py 引用；其余是跑测试留下的脚本/报告，按用户要求不留）
@@ -225,6 +240,11 @@ def should_skip(rel: str, with_exe: bool = False, with_data: bool = False) -> bo
     # ① 版本库/备份/缓存，一律不要
     if any(x in EXCLUDE_ANY for x in parts):
         return True
+
+    # ★ 2026-11-08（按用户要求）：记忆库与索引不进任何交付（含可运行版）
+    for _pre in HARD_EXCLUDE_PREFIXES:
+        if rel == _pre.rstrip('/') or rel.startswith(_pre):
+            return True
 
     # ② 大件：没有 exe 的交付（源码版）不要
     if rel in BIG_FILES and not with_exe:
