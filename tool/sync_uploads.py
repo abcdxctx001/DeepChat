@@ -99,6 +99,9 @@ EXCLUDE_PREFIX = (
     'server/logs/thinking_dump/',
     # ★ 2026-10-21：文档合并为**单一根 README**，交付目录里不再保留 server/README.md
     'server/README.md',
+    # ★ 2026-11-15（按用户要求）：根目录 AGENTS.md 是给 AI 助手的内部协作约定，
+    #   含本机路径与授权说明，不随交付目录 / 公开仓库分发。
+    'AGENTS.md',
     # ★ 2026-10-30：tool/examples 里的 C++ 编译产物（examples/DeepAIde 的 .build/ 下
     #   有 4 个 main.exe，约 7.7 MB）—— .gitignore 已挡 *.exe，交付目录也不该带。
     'tool/examples/DeepAIde/workspace/.build/',
